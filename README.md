@@ -138,29 +138,52 @@ Safety decision engine:
 
 ### Prerequisites
 - Python 3.8+
-- CUDA 11.8+ (for GPU acceleration) or CPU mode
 - OpenCV 4.5+
-- PyTorch 2.0+
 - NumPy, SciPy
 - FilterPy (Kalman Filter implementation)
+- Device-specific PyTorch installation (see Step 2)
 
-### Setup
+### Step 1: Clone Repository
 ```bash
-# Clone repository
 git clone https://github.com/lakshyasaxena07/yolopv2_overtaking.git
 cd yolopv2_overtaking
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Download YOLOPv2 model weights
-# Place yolopv2.pt in models/ folder
-# Download from: https://github.com/hustvl/YOLOP
 ```
 
-### Note on Model File
+### Step 2: Ensure Proper Device Setup (PyTorch)
+This project supports multiple hardware accelerators. Before installing the rest of the dependencies, install PyTorch according to your device:
+
+#### 🟢 Option A: NVIDIA GPU (CUDA)
+For maximum performance using NVIDIA graphics cards.
+```bash
+# Install PyTorch with CUDA 11.8 support
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+```
+
+#### 🔵 Option B: Intel GPU (Intel Arc / Iris Xe)
+For hardware acceleration on Intel GPUs using Intel Extension for PyTorch.
+```bash
+# Install PyTorch with Intel XPU support
+python -m pip install torch torchvision torchaudio --index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+```
+*(Note for Intel GPU users: Make sure your Intel graphics drivers are up to date).*
+
+#### ⚪ Option C: CPU Only
+For laptops, older devices, or running without a dedicated supported graphics card.
+```bash
+# Install CPU-only PyTorch
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+### Step 3: Install Remaining Dependencies
+```bash
+# Install OpenCV, SciPy, FilterPy, etc.
+pip install -r requirements.txt
+```
+
+### Step 4: Download Model Weights
 The YOLOPv2 model weights (`models/yolopv2.pt`) are not included in the repository due to size constraints (149MB). 
-Download it separately from the [YOLOP GitHub repository](https://github.com/hustvl/YOLOP) and place it in the `models/` folder.
+1. Download `yolopv2.pt` from the [YOLOP GitHub repository](https://github.com/hustvl/YOLOP) or equivalent weights.
+2. Place the downloaded file in the `models/` folder inside the project.
 
 ## 🎮 Usage
 
