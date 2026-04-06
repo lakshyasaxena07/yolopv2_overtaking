@@ -152,14 +152,14 @@ class YOLOPv2Detector:
         mask_h, mask_w = da_mask.shape[:2]
 
         # Letterbox resize — aspect ratio maintain karo
-        # frame_for_seg = self._letterbox(
-        #     frame.copy(),
-        #     new_shape=(mask_h, mask_w)
-        # )
-        frame_for_seg = cv2.resize(
-            frame, (1280, 720),
-            interpolation=cv2.INTER_LINEAR
+        frame_for_seg = self._letterbox(
+            frame.copy(),
+            new_shape=(mask_h, mask_w)
         )
+        # frame_for_seg = cv2.resize(
+        #     frame, (1280, 720),
+        #     interpolation=cv2.INTER_LINEAR
+        # )
         if show_da or show_ll:
             _da = da_mask if show_da else \
                   np.zeros_like(da_mask)
