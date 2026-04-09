@@ -60,13 +60,17 @@ class OvertakingAnalyzer:
         for v in tracked:
             cx = (v["bbox"][0] + v["bbox"][2]) // 2
             if v.get("direction") == "oncoming" and on_x1 <= cx <= on_x2:
+                if v.get("distance", 0) > 50:
+                    continue
                 self._history.append(False)
-                return (False, f"Oncoming " f"({v.get('distance',0):.0f}m)")
+                return (False, f"Oncoming ({v.get('distance',0):.0f}m)")
             if ov_x1 <= cx <= ov_x2:
+                if v.get("distance", 0) > 50:
+                    continue
                 self._history.append(False)
                 return (
                     False,
-                    f"Vehicle in overtake lane " f"({v.get('distance',0):.0f}m)",
+                    f"Vehicle in overtake lane ({v.get('distance',0):.0f}m)",
                 )
 
         self._history.append(True)
@@ -141,21 +145,24 @@ class HUDRenderer:
             bcol, txt, tcol = \
                 (0,0,140), "UNSAFE", self.UNSAFE_COL
 
-        cv2.rectangle(frame,(0,h-82),(w,h),bcol,-1)
+        cv2.rectangle(frame,(0,h-85),(w,h),bcol,-1)
         ts = cv2.getTextSize(
             txt, cv2.FONT_HERSHEY_DUPLEX, 1.8, 3)[0]
         cv2.putText(frame, txt,
-            ((w-ts[0])//2, h-30),
+            ((w-ts[0])//2, h-45),
             cv2.FONT_HERSHEY_DUPLEX, 1.8, tcol, 3)
-        cv2.putText(frame, reason[:72],
-            (12, h-10),
+            
+        rs = cv2.getTextSize(reason, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        cv2.putText(frame, reason,
+            ((w-rs[0])//2, h-12),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.58, (220,220,220), 1)
+            0.7, (220,220,220), 2)
+            
         cv2.putText(frame,
             "D=drivable  L=lanes  R=restart  Q=quit",
-            (w-380, h-90),
+            (w-400, h - 90 - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.42, (170,170,170), 1)
+            0.45, (170,170,170), 1)
         return frame
 
     
@@ -197,9 +204,16 @@ def run(video_path, cfg):
     ego_spd = 0.0
     t_prev = time.time()
 
-    print(f"\nPlaying: {Path(video_path).name}")
-    print("D=drivable  L=lanes  Space=pause" "  R=restart  Q=quit\n")
+    # Check karein ki path string hai ya camera index (int)
+    if isinstance(video_path, str):
+        display_name = Path(video_path).name
+    else:
+        display_name = f"Live Camera (Index {video_path})"
 
+    print(f"\nStarting: {display_name}")
+    print("D=drivable  L=lanes  Space=pause"
+          "  R=restart  Q=quit\n")
+    
     while True:
         loop_start = time.time()
 
@@ -220,7 +234,7 @@ def run(video_path, cfg):
             # Detection every SKIP_FRAMES
             if frame_n % cfg.SKIP_FRAMES == 0:
 
-                detections, seg_frame, _ = detector.detect(
+                detections, seg_frame, orig_shape, da_mask = detector.detect(
                     frame, show_da=show_da, show_ll=show_ll
                 )
                 last_seg_frame = seg_frame
@@ -247,9 +261,7 @@ def run(video_path, cfg):
                     x2 = int(t["bbox"][2])
                     y2 = int(t["bbox"][3])
                     cid = t.get("class_id", 2)
-                    vw = detector.get_vehicle_width(cid)
-
-                    dist = estimator.estimate_distance(x1, y1, x2, y2, vw)
+                    dist = estimator.estimate_distance(tid, x1, y1, x2, y2, cid)
                     spd = estimator.estimate_speed(tid, dist)
                     dire = estimator.estimate_direction(tid, x1, y1, x2, y2, orig_h)
 
@@ -270,8 +282,43 @@ def run(video_path, cfg):
                 # Safety
                 feasible, reason = analyzer.analyze(orig_w, orig_h, tracked)
 
-                enriched = [
-                    {
+                enriched = []
+                for v in tracked:
+                    cx = (v["bbox"][0] + v["bbox"][2]) // 2
+                    is_ego = False
+                    if cfg.DRIVING_MODE == "india":
+                        is_ego = cx < int(orig_w * 0.50)
+                    else:
+                        is_ego = cx >= int(orig_w * 0.50)
+
+                    if v["direction"] == "oncoming":
+                        zone = "oncoming_lane"
+                    elif is_ego:
+                        zone = "ego_lane"
+                    else:
+                        zone = "overtake_lane"
+                        
+                    # Mask-Gated ROI: 5x5 Area-Interest
+                    bx_hud = min(max(int(cx * 1280 / orig_w), 0), 1279)
+                    by_hud = min(max(int(v["bbox"][3] * 720 / orig_h), 0), 719)
+                    
+                    on_road = True
+                    if da_mask is not None:
+                        x_min = max(0, bx_hud - 2)
+                        x_max = min(1280, bx_hud + 3)
+                        y_min = max(0, by_hud - 2)
+                        y_max = min(720, by_hud + 3)
+                        roi = da_mask[y_min:y_max, x_min:x_max]
+                        if roi.size > 0:
+                            on_road = (np.sum(roi) / roi.size) > 0.40
+                        else:
+                            on_road = False
+                            
+                    # TTC Weighted Safety for Ego Lane
+                    is_closing_fast = v["rel_speed_kmh"] > 10.0
+                    gap_threshold = 30.0 if is_closing_fast else 25.0
+
+                    enriched.append({
                         "track_id": v["id"],
                         "bbox": v["bbox"],
                         "distance_m": v["distance"],
@@ -279,34 +326,38 @@ def run(video_path, cfg):
                         "direction": v["direction"],
                         "class_name": v["class_name"],
                         "is_oncoming": v["direction"] == "oncoming",
-                        "is_relevant": True,
-                        "is_too_close": v["distance"] < 12,
+                        "is_relevant": on_road,
+                        "is_too_close": v["distance"] < gap_threshold and zone == "ego_lane",
+                        "is_critical": v["distance"] < 8.0,
                         "is_parked": False,
                         "approach_rate": (
                             v["rel_speed_kmh"] / 3.6
                             if v["direction"] == "oncoming"
                             else 0.0
                         ),
-                        "zone": (
-                            "oncoming_lane"
-                            if v["direction"] == "oncoming"
-                            else "ego_lane"
-                        ),
-                    }
-                    for v in tracked
-                ]
+                        "zone": zone,
+                    })
 
                 ttc_dec = ttc.evaluate(enriched, None)
 
-                if not feasible:
+                critical_vehicles = [v for v in enriched if v.get("is_critical")]
+                too_close_ego = [v for v in enriched if v.get("is_too_close")]
+
+                if critical_vehicles:
+                    last_safety = SafetyLevel.UNSAFE
+                    last_reason = "CRITICAL | Brake Now"
+                elif not feasible:
                     last_safety = SafetyLevel.UNSAFE
                     last_reason = f"NO OVERTAKE | {reason}"
                 elif ttc_dec.level == SafetyLevel.UNSAFE:
                     last_safety = SafetyLevel.UNSAFE
-                    last_reason = f"TOO CLOSE | {ttc_dec.reason}"
+                    last_reason = ttc_dec.reason
+                elif too_close_ego:
+                    last_safety = SafetyLevel.RISKY
+                    last_reason = "CAUTION | Gap too small for maneuver"
                 elif ttc_dec.level == SafetyLevel.RISKY:
                     last_safety = SafetyLevel.RISKY
-                    last_reason = f"CAUTION | {ttc_dec.reason}"
+                    last_reason = ttc_dec.reason
                 else:
                     last_safety = SafetyLevel.SAFE
                     last_reason = "SAFE TO OVERTAKE"
@@ -371,11 +422,19 @@ def run(video_path, cfg):
             show_ll = not show_ll
             print(f"Lanes: {'ON' if show_ll else 'OFF'}")
 
+        elif key in [ord('r'), ord('R')]:
+            if isinstance(video_path, str): # Sirf video files ke liye restart allow karein
+                cap.release()
+                cv2.destroyAllWindows()
+                return True
+            else:
+                print("Restart not available for live camera.")
+
     cap.release()
     cv2.destroyAllWindows()
     return True
 
-
+"""
 if __name__ == "__main__":
     cfg = Config()
     print("=" * 55)
@@ -391,6 +450,33 @@ if __name__ == "__main__":
         print(f"Selected: {Path(video).name}")
         if not run(video, cfg):
             break
+
+    print("\nGoodbye!")
+    cv2.destroyAllWindows()"""
+
+
+# main.py ke bottom block ko isse replace karein
+if __name__ == "__main__":
+    cfg = Config()
+    print("=" * 55)
+    print("  YOLOPv2 Overtaking Safety System - LIVE")
+    print("=" * 55)
+
+    mode = input("Choose Mode: [1] Video File | [2] Laptop Cam | [3] Phone Cam: ")
+
+    if mode == '1':
+        video = select_video(cfg) # Purana file selection
+    elif mode == '2':
+        video = cfg.CAMERA_SOURCE # Index 0 use hoga
+    elif mode == '3':
+        video = input("Enter Phone IP URL (e.g., http://192.168.1.5:8080/video): ")
+    else:
+        print("Invalid choice. Exiting.")
+        sys.exit()
+
+    if video is not None:
+        # run() function int aur string dono handle karta hai
+        run(video, cfg) 
 
     print("\nGoodbye!")
     cv2.destroyAllWindows()

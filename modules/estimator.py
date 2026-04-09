@@ -17,6 +17,8 @@ class Estimator:
         self.cfg             = config
         self._dist_history   = defaultdict(
             lambda: deque(maxlen=15))
+        self._raw_dist_history = defaultdict(
+            lambda: deque(maxlen=5))
         self._bbox_history   = defaultdict(
             lambda: deque(maxlen=10))
         self._dir_votes      = defaultdict(
@@ -31,18 +33,29 @@ class Estimator:
 
     # ── Distance ──────────────────────────────────────────────
 
-    def estimate_distance(self, x1, y1, x2, y2,
-                          real_width_m=1.8):
+    def estimate_distance(self, track_id, x1, y1, x2, y2, class_id=2):
         """
-        Pinhole camera model se distance.
+        Pinhole camera model se distance with Moving Average.
         dist = (real_width * focal_length) / pixel_width
         """
+        width_map = {
+            2: self.cfg.REAL_CAR_WIDTH_M,
+            7: self.cfg.REAL_TRUCK_WIDTH_M,
+            5: self.cfg.REAL_BUS_WIDTH_M,
+            3: self.cfg.REAL_CAR_WIDTH_M,
+            1: self.cfg.REAL_BIKE_WIDTH_M
+        }
+        real_width_m = width_map.get(class_id, self.cfg.REAL_CAR_WIDTH_M)
+        
         pix_w = x2 - x1
         if pix_w < 5:
-            return 999.0
-        dist = (real_width_m * self.cfg.FOCAL_LENGTH_PX) \
-               / pix_w
-        return round(dist, 2)
+            raw_dist = 999.0
+        else:
+            raw_dist = (real_width_m * self.cfg.FOCAL_LENGTH_PX) / pix_w
+            
+        self._raw_dist_history[track_id].append(raw_dist)
+        avg_dist = sum(self._raw_dist_history[track_id]) / len(self._raw_dist_history[track_id])
+        return round(avg_dist, 2)
 
     # ── Speed ─────────────────────────────────────────────────
 
@@ -214,6 +227,7 @@ class Estimator:
     def cleanup(self, active_ids):
         """Stale track data remove karo."""
         for store in [self._dist_history,
+                      self._raw_dist_history,
                       self._bbox_history,
                       self._dir_votes]:
             for k in list(store.keys()):

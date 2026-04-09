@@ -53,8 +53,8 @@ class TTCEngine:
     }
 
     def __init__(self, cfg=None):
-        self.TTC_SAFE  = 6.0
-        self.TTC_RISKY = 3.5
+        self.TTC_SAFE  = 5.0
+        self.TTC_RISKY = 2.5
         self._history  = deque(maxlen=5)
 
     def compute_ttc(self, distance_m, approach_rate_mps):

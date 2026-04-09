@@ -97,24 +97,40 @@ class YOLOPv2Detector:
                         "cls":  int(cls)
                     })
 
-        # 5. Segmentation Masks (Direct scaling for HUD display)
-        da_mask = driving_area_mask(seg)
-        ll_mask = lane_line_mask(ll)
+        # 5. Segmentation Masks (Dynamic extraction based on padding)
+        y_start, y_end = int(round(dh)), int(round(self.img_size - dh))
+        x_start, x_end = int(round(dw)), int(round(self.img_size - dw))
+
         seg_img = cv2.resize(frame, (1280, 720)) # Final HUD size
         
-        if show_da or show_ll:
-            _da = cv2.resize(da_mask, (1280, 720), interpolation=cv2.INTER_NEAREST) if show_da else np.zeros((720, 1280), dtype=np.uint8)
-            _ll = cv2.resize(ll_mask, (1280, 720), interpolation=cv2.INTER_NEAREST) if show_ll else np.zeros((720, 1280), dtype=np.uint8)
-            show_seg_result(seg_img, (_da, _ll), is_demo=True)
+        # Unconditionally compute masks for structural gating downstream
+        da_valid = seg[:, :, y_start:y_end, x_start:x_end]
+        da_mask = torch.nn.functional.interpolate(da_valid, size=(720, 1280), mode='bilinear', align_corners=False)
+        _, da_mask = torch.max(da_mask, 1)
+        _da = da_mask.int().squeeze().cpu().numpy()
+        
+        ll_valid = ll[:, :, y_start:y_end, x_start:x_end]
+        ll_mask = torch.nn.functional.interpolate(ll_valid, size=(720, 1280), mode='bilinear', align_corners=False)
+        ll_mask = torch.round(ll_mask).squeeze(1)
+        _ll = ll_mask.int().squeeze().cpu().numpy()
 
-        return detections, seg_img, orig_shape
+        # Z-Order Rendering: Draw Drivable FIRST, Lane Lines SECOND
+        if show_da:
+            mask = _da == 1
+            seg_img[mask] = seg_img[mask] * 0.6 + np.array([0, 255, 0], dtype=np.uint8) * 0.4
+            
+        if show_ll:
+            mask = _ll == 1
+            seg_img[mask] = seg_img[mask] * 0.2 + np.array([0, 0, 255], dtype=np.uint8) * 0.8
+
+        return detections, seg_img, orig_shape, _da
 
     def get_vehicle_width(self, cls_id):
         width_map = {
             2: self.cfg.REAL_CAR_WIDTH_M,
             7: self.cfg.REAL_TRUCK_WIDTH_M,
             5: self.cfg.REAL_BUS_WIDTH_M,
-            3: self.cfg.REAL_BIKE_WIDTH_M,
+            3: self.cfg.REAL_CAR_WIDTH_M,
             1: self.cfg.REAL_BIKE_WIDTH_M
         }
         return width_map.get(cls_id, self.cfg.REAL_CAR_WIDTH_M)

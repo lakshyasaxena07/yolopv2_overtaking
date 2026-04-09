@@ -78,6 +78,7 @@ Thumbs.db
 *.zip
 *.tar
 *.tar.gz
+test/
 
 # Environment variables
 .env
