@@ -16,6 +16,7 @@ from modules.yolopv2_detector import YOLOPv2Detector
 from modules.tracker import SORTTracker
 from modules.estimator import Estimator
 from modules.ttc_engine import TTCEngine, SafetyLevel
+from modules.lane_path_filter import LanePathFilter
 
 YOLOPV2_DIR = Path(r"E:\Minor 2\claude\YOLOPv2")
 sys.path.insert(0, str(YOLOPV2_DIR))
@@ -45,17 +46,28 @@ class OvertakingAnalyzer:
         self.cfg = config
         self._history = deque([True] * 5, maxlen=10)
 
-    def analyze(self, frame_w, frame_h, tracked):
-        if self.cfg.DRIVING_MODE == "india":
-            ov_x1 = int(frame_w * 0.50)
-            ov_x2 = int(frame_w * 0.75)
-            on_x1 = int(frame_w * 0.50)
-            on_x2 = int(frame_w * 0.75)
+    def analyze(self, frame_w, frame_h, tracked, path_filter=None):
+        """Analyze overtaking feasibility using dynamic lane boundaries."""
+        # Use dynamic boundaries from path_filter if available
+        scan_y = frame_h - 100  # Same scan row as LanePathFilter
+        if path_filter is not None and path_filter.is_dynamic:
+            ov_x1, ov_x2 = path_filter.get_dynamic_overtake_bounds(scan_y)
+            # Scale from HUD (1280) to original frame width
+            ov_x1 = int(ov_x1 * frame_w / 1280)
+            ov_x2 = int(ov_x2 * frame_w / 1280)
+            on_x1, on_x2 = ov_x1, ov_x2
         else:
-            ov_x1 = int(frame_w * 0.50)
-            ov_x2 = int(frame_w * 0.75)
-            on_x1 = 0
-            on_x2 = int(frame_w * 0.25)
+            # Fallback: hardcoded ratios
+            if self.cfg.DRIVING_MODE == "india":
+                ov_x1 = int(frame_w * 0.50)
+                ov_x2 = int(frame_w * 0.75)
+                on_x1 = int(frame_w * 0.50)
+                on_x2 = int(frame_w * 0.75)
+            else:
+                ov_x1 = int(frame_w * 0.50)
+                ov_x2 = int(frame_w * 0.75)
+                on_x1 = 0
+                on_x2 = int(frame_w * 0.25)
 
         for v in tracked:
             cx = (v["bbox"][0] + v["bbox"][2]) // 2
@@ -87,7 +99,7 @@ class HUDRenderer:
     UNSAFE_COL = (0, 0, 255)
 
     def render(self, frame, fps, tracks, ego_speed,
-               safety, reason, cfg):
+               safety, reason, cfg, lane_mode="OPTICAL", confidence=1.0):
         h, w = frame.shape[:2]
 
         cv2.rectangle(frame, (0,0), (w,52),
@@ -105,6 +117,23 @@ class HUDRenderer:
                     (360,36),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.85, self.INFO_COL, 2)
+
+        # ── Mode indicator (top-right) ────────────────────
+        mode_txt = f"MODE: {lane_mode}"
+        if "VIRTUAL" in lane_mode:
+            mode_col = (0, 0, 255)    # Red for virtual/green-mask
+        elif "MEMORY" in lane_mode:
+            mode_col = (0, 140, 255)  # Orange for memory
+        elif "FALLBACK" in lane_mode:
+            mode_col = (0, 0, 200)    # Dark red for fallback
+        else:
+            mode_col = (0, 220, 0)    # Green for optical
+        mt_size = cv2.getTextSize(mode_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
+        mx = w - mt_size[0] - 12
+        # Background pill for mode badge
+        cv2.rectangle(frame, (mx - 6, 10), (w - 4, 42), (30, 30, 30), -1)
+        cv2.putText(frame, mode_txt, (mx, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_col, 2)
 
         for v in tracks:
             x1 = int(v["bbox"][0])
@@ -173,6 +202,7 @@ def run(video_path, cfg):
     estimator = Estimator(cfg)
     ttc = TTCEngine(cfg)
     analyzer = OvertakingAnalyzer(cfg)
+    path_filter = LanePathFilter()
     hud = HUDRenderer()
 
     cap = cv2.VideoCapture(video_path)
@@ -234,10 +264,16 @@ def run(video_path, cfg):
             # Detection every SKIP_FRAMES
             if frame_n % cfg.SKIP_FRAMES == 0:
 
-                detections, seg_frame, orig_shape, da_mask = detector.detect(
+                detections, seg_frame, orig_shape, da_mask, ll_mask = detector.detect(
                     frame, show_da=show_da, show_ll=show_ll
                 )
                 last_seg_frame = seg_frame
+
+                # Update dynamic lane boundaries
+                path_filter.update(ll_mask, da_mask, 720, 1280)
+
+                # ── Blind-Mode flag for strict safety overrides ──
+                is_blind_mode = path_filter.is_blind
 
                 # Track
                 track_input = [
@@ -280,43 +316,32 @@ def run(video_path, cfg):
                 ego_spd = estimator.estimate_ego_motion(frame)
 
                 # Safety
-                feasible, reason = analyzer.analyze(orig_w, orig_h, tracked)
+                feasible, reason = analyzer.analyze(
+                    orig_w, orig_h, tracked, path_filter
+                )
 
                 enriched = []
                 for v in tracked:
-                    cx = (v["bbox"][0] + v["bbox"][2]) // 2
-                    is_ego = False
-                    if cfg.DRIVING_MODE == "india":
-                        is_ego = cx < int(orig_w * 0.50)
-                    else:
-                        is_ego = cx >= int(orig_w * 0.50)
+                    bbox = v["bbox"]
 
+                    # Dynamic Right-Side Filter: skip vehicles right of corridor
+                    if path_filter.is_right_of_corridor(bbox, orig_h, orig_w):
+                        continue
+
+                    # Area-Voting Gating: 5x5 drivable mask check
+                    on_road = path_filter.is_on_drivable(bbox, da_mask, orig_h, orig_w)
+
+                    # Dynamic Zone Classification using lane boundaries
                     if v["direction"] == "oncoming":
                         zone = "oncoming_lane"
-                    elif is_ego:
-                        zone = "ego_lane"
                     else:
-                        zone = "overtake_lane"
+                        zone = path_filter.classify_zone(bbox, orig_h, orig_w)
                         
-                    # Mask-Gated ROI: 5x5 Area-Interest
-                    bx_hud = min(max(int(cx * 1280 / orig_w), 0), 1279)
-                    by_hud = min(max(int(v["bbox"][3] * 720 / orig_h), 0), 719)
-                    
-                    on_road = True
-                    if da_mask is not None:
-                        x_min = max(0, bx_hud - 2)
-                        x_max = min(1280, bx_hud + 3)
-                        y_min = max(0, by_hud - 2)
-                        y_max = min(720, by_hud + 3)
-                        roi = da_mask[y_min:y_max, x_min:x_max]
-                        if roi.size > 0:
-                            on_road = (np.sum(roi) / roi.size) > 0.40
-                        else:
-                            on_road = False
-                            
                     # TTC Weighted Safety for Ego Lane
+                    # Blind-Mode: raise MANEUVER_GAP from 25m to 35m
                     is_closing_fast = v["rel_speed_kmh"] > 10.0
-                    gap_threshold = 30.0 if is_closing_fast else 25.0
+                    base_gap = 35.0 if is_blind_mode else 25.0
+                    gap_threshold = 30.0 if is_closing_fast else base_gap
 
                     enriched.append({
                         "track_id": v["id"],
@@ -359,8 +384,24 @@ def run(video_path, cfg):
                     last_safety = SafetyLevel.RISKY
                     last_reason = ttc_dec.reason
                 else:
-                    last_safety = SafetyLevel.SAFE
-                    last_reason = "SAFE TO OVERTAKE"
+                    # ── Blind-Mode Strict Safety Override ───────────
+                    if is_blind_mode:
+                        # Check if ANY vehicle is in the overtake lane
+                        overtake_lane_occupied = any(
+                            v.get("zone") == "overtake_lane"
+                            for v in enriched
+                        )
+                        if overtake_lane_occupied:
+                            # Force UNSAFE — no 'Safe to Overtake' allowed
+                            last_safety = SafetyLevel.UNSAFE
+                            last_reason = "CAUTION | Blind Driving | Reduced Confidence"
+                        else:
+                            # Cap SAFE → CAUTION when lane lines are missing
+                            last_safety = SafetyLevel.RISKY
+                            last_reason = "CAUTION | Blind Driving | Reduced Confidence"
+                    else:
+                        last_safety = SafetyLevel.SAFE
+                        last_reason = "SAFE TO OVERTAKE"
 
                 estimator.cleanup({t["id"] for t in last_tracks})
 
@@ -391,7 +432,9 @@ def run(video_path, cfg):
                 scaled.append(sv)
 
             display = hud.render(
-                display, fps, scaled, ego_spd, last_safety, last_reason, cfg
+                display, fps, scaled, ego_spd, last_safety, last_reason, cfg,
+                lane_mode=path_filter.mode_display,
+                confidence=path_filter.confidence_score
             )
             cv2.imshow("YOLOPv2 Overtaking Safety", display)
 

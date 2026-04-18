@@ -123,7 +123,7 @@ class YOLOPv2Detector:
             mask = _ll == 1
             seg_img[mask] = seg_img[mask] * 0.2 + np.array([0, 0, 255], dtype=np.uint8) * 0.8
 
-        return detections, seg_img, orig_shape, _da
+        return detections, seg_img, orig_shape, _da, _ll
 
     def get_vehicle_width(self, cls_id):
         width_map = {
