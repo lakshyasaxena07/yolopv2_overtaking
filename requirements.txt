@@ -1,0 +1,22 @@
+# YOLOPv2 Overtaking Safety System - Dependencies
+# -------------------------------------------------
+# NOTE: PyTorch (torch, torchvision, torchaudio) is NOT listed here
+# because it requires device-specific installation.
+# See README.md Step 2 for CUDA / Intel XPU / CPU instructions.
+# -------------------------------------------------
+
+# Computer Vision
+opencv-python>=4.5.0
+
+# Scientific Computing
+numpy>=1.21.0
+scipy>=1.7.0
+
+# Kalman Filter (used by SORT tracker)
+filterpy>=1.4.5
+
+# ONNX Runtime (GPU) — for accelerated inference
+# Install ONE of the following based on your hardware:
+#   pip install onnxruntime-gpu    (NVIDIA CUDA)
+#   pip install onnxruntime        (CPU only)
+onnxruntime-gpu>=1.15.0
