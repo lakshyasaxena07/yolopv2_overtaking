@@ -25,10 +25,33 @@ class YOLOPv2Detector:
         self.half = self.device.type != "cpu"
         self.stride = 32
         self.img_size = config.IMG_SIZE
+        self.use_onnx = False
         self._load_model()
 
     def _load_model(self):
-        """Sirf model load aur warmup ke liye. Yahan 'frame' variable use nahi karna."""
+        """Load model: ONNX runtime first, fallback to PyTorch JIT."""
+        # ── ONNX Runtime Load ──
+        if getattr(self.cfg, "USE_ONNX", False):
+            try:
+                import onnxruntime as ort
+                print(f"YOLOPv2 attempting ONNX Runtime load: {self.cfg.ONNX_MODEL_PATH}")
+                # Prefer TensorRT, then CUDA, then CPU
+                providers = []
+                if self.device.type == "cuda":
+                    providers.append('TensorrtExecutionProvider')
+                    providers.append('CUDAExecutionProvider')
+                providers.append('CPUExecutionProvider')
+                
+                self.ort_session = ort.InferenceSession(self.cfg.ONNX_MODEL_PATH, providers=providers)
+                self.ort_input_name = self.ort_session.get_inputs()[0].name
+                self.use_onnx = True
+                print(f"YOLOPv2 ONNX active with providers: {self.ort_session.get_providers()}")
+                return
+            except Exception as e:
+                print(f"ONNX Load failed: {e}. Falling back to PyTorch JIT.")
+                self.use_onnx = False
+
+        # ── PyTorch JIT Load (Fallback) ──
         print(f"YOLOPv2 loading: {self.cfg.MODEL_PATH}")
         self.model = torch.jit.load(self.cfg.MODEL_PATH, map_location=self.device)
         if self.half:
@@ -58,18 +81,35 @@ class YOLOPv2Detector:
         # 2. Pre-process
         img = img_lb[:, :, ::-1].transpose(2, 0, 1)
         img = np.ascontiguousarray(img)
-        tensor = torch.from_numpy(img).to(self.device)
-        tensor = tensor.half() if self.half else tensor.float()
-        tensor /= 255.0
-        if tensor.ndimension() == 3:
-            tensor = tensor.unsqueeze(0)
+        
+        if self.use_onnx:
+            # NumPy array for ONNX Runtime (zero-copy when using IOBinding, but direct feed is okay for now)
+            input_tensor = img.astype(np.float16 if self.half else np.float32)
+            input_tensor /= 255.0
+            if input_tensor.ndim == 3:
+                input_tensor = np.expand_dims(input_tensor, 0)
+                
+            outs = self.ort_session.run(None, {self.ort_input_name: input_tensor})
+            
+            # Map outputs matching ONNX fp16 trace structure
+            pred_list = [torch.from_numpy(p).to(self.device) for p in outs[0]]
+            anchor_list = [torch.from_numpy(a).to(self.device) for a in outs[1:4]]
+            seg = torch.from_numpy(outs[4]).to(self.device)
+            ll = torch.from_numpy(outs[5]).to(self.device)
+            
+            pred = split_for_trace_model(pred_list, anchor_list)
+        else:
+            tensor = torch.from_numpy(img).to(self.device)
+            tensor = tensor.half() if self.half else tensor.float()
+            tensor /= 255.0
+            if tensor.ndimension() == 3:
+                tensor = tensor.unsqueeze(0)
 
-        # 3. Inference
-        with torch.no_grad():
-            [pred, anchor_grid], seg, ll = self.model(tensor)
-
-        # 4. Process Bounding Boxes (NMS + Correct Scaling)
-        pred = split_for_trace_model(pred, anchor_grid)
+            # 3. Inference
+            with torch.no_grad():
+                [pred_list, anchor_list], seg, ll = self.model(tensor)
+            
+            pred = split_for_trace_model(pred_list, anchor_list)
         pred = non_max_suppression(
             pred, self.cfg.CONF_THRESH, self.cfg.IOU_THRESH,
             classes=self.cfg.VEHICLE_CLASSES, agnostic=False

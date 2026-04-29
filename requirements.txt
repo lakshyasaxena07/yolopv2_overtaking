@@ -20,3 +20,4 @@ filterpy>=1.4.5
 #   pip install onnxruntime-gpu    (NVIDIA CUDA)
 #   pip install onnxruntime        (CPU only)
 onnxruntime-gpu>=1.15.0
+onnx>=1.14.0

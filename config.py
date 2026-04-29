@@ -4,6 +4,8 @@ class Config:
 
     # ── YOLOPv2 Model ──────────────────────────────────────────
     MODEL_PATH       = r"E:\Minor 2\Most_Stable\Claude\yolopv2\models\yolopv2.pt"
+    ONNX_MODEL_PATH  = r"E:\Minor 2\Most_Stable\Claude\yolopv2\models\yolopv2_fp16.onnx"
+    USE_ONNX         = True
     DEVICE           = "cuda"
     CONF_THRESH      = 0.25
     IOU_THRESH       = 0.45
@@ -50,7 +52,7 @@ class Config:
     MIN_OVERTAKE_CLEAR = 0.15       # 15% minimum clear area
 
     # ── Videos ─────────────────────────────────────────────────
-    VIDEOS_FOLDER    = r"E:\Minor 2\Most_Stable\Claude\Overtaking_safety\Test\Custom_videos"
+    VIDEOS_FOLDER    = "experiments/videos"
 
     # ── Debug ──────────────────────────────────────────────────
     SHOW_EGO_SPEED       = True

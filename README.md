@@ -100,7 +100,6 @@ When lane lines are lost (rain, night, poor markings), the system degrades grace
 yolopv2/
 ├── main.py                              # Main application entry point & HUD renderer
 ├── config.py                            # All configuration parameters
-├── export_onnx.py                       # PyTorch → ONNX FP16 export script
 ├── requirements.txt                     # Python dependencies
 ├── README.md                            # This file
 ├── .gitignore                           # Git ignore rules
@@ -114,8 +113,10 @@ yolopv2/
 │   ├── estimator.py                     # Distance / speed / direction estimation
 │   ├── ttc_engine.py                    # Safety decision engine
 │   └── lane_path_filter.py             # Dynamic lane-based path filtering + Blind-Mode
-└── Test/
-    └── videos/                          # Test video directory
+├── scripts/
+│   ├── export_onnx.py                   # PyTorch → ONNX FP16 export script
+│   └── test_onnx.py                     # ONNX validation script
+└── experiments/                         # Scratchpad, logs, and outputs (not tracked)
 ```
 
 ---
@@ -222,7 +223,7 @@ pip install -r requirements.txt
 The model weights are **not included** in the repository due to size constraints:
 
 1. **PyTorch weights** (`yolopv2.pt`, ~149MB): Download from the [YOLOPv2 GitHub](https://github.com/hustvl/YOLOP)
-2. **ONNX FP16 model** (`yolopv2_fp16.onnx`): Export using `export_onnx.py` or download pre-exported weights
+2. **ONNX FP16 model** (`yolopv2_fp16.onnx`): Export using `scripts/export_onnx.py` or download pre-exported weights
 3. Place the downloaded files in the `models/` directory
 
 ---

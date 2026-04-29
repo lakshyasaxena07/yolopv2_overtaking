@@ -9,6 +9,8 @@ import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
 from collections import deque
+import threading
+import argparse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import Config
@@ -194,7 +196,60 @@ class HUDRenderer:
             0.45, (170,170,170), 1)
         return frame
 
-    
+class ThreadedCamera:
+    """Background frame grabber to prevent USB camera latency and GPU starvation."""
+    def __init__(self, src=0, width=1280, height=720):
+        self.cap = cv2.VideoCapture(src)
+        self.width = width
+        self.height = height
+        # Removed cap.set() hardware overrides here to prevent green screen issues with DroidCam
+        self.grabbed, frame = self.cap.read()
+        if self.grabbed and frame is not None:
+            self.frame = cv2.resize(frame, (self.width, self.height))
+        else:
+            self.frame = None
+        self.started = False
+        self.read_lock = threading.Lock()
+        self.stopped = False
+
+    def start(self):
+        if not self.cap.isOpened():
+            return self
+        if self.started:
+            return self
+        self.started = True
+        self.thread = threading.Thread(target=self.update, args=())
+        self.thread.daemon = True
+        self.thread.start()
+        return self
+
+    def update(self):
+        while not self.stopped:
+            grabbed, frame = self.cap.read()
+            if grabbed and frame is not None:
+                # Safely upsample the frame in software without breaking the virtual camera driver
+                frame = cv2.resize(frame, (self.width, self.height))
+            with self.read_lock:
+                self.grabbed = grabbed
+                self.frame = frame
+
+    def read(self):
+        with self.read_lock:
+            if self.frame is not None:
+                return self.grabbed, self.frame.copy()
+            return self.grabbed, None
+
+    def release(self):
+        self.stopped = True
+        if self.started:
+            self.thread.join()
+        self.cap.release()
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def get(self, propId):
+        return self.cap.get(propId)
 
 def run(video_path, cfg):
     detector = YOLOPv2Detector(cfg)
@@ -205,7 +260,13 @@ def run(video_path, cfg):
     path_filter = LanePathFilter()
     hud = HUDRenderer()
 
-    cap = cv2.VideoCapture(video_path)
+    if isinstance(video_path, int):
+        print(f"Configuring Live Camera (Index {video_path}) with Threaded Grabber...")
+        # Force 720p to prevent 4K overhead from phone
+        cap = ThreadedCamera(video_path, width=1280, height=720).start()
+    else:
+        cap = cv2.VideoCapture(video_path)
+
     if not cap.isOpened():
         print(f"Video open nahi hui: {video_path}")
         return False
@@ -338,9 +399,9 @@ def run(video_path, cfg):
                         zone = path_filter.classify_zone(bbox, orig_h, orig_w)
                         
                     # TTC Weighted Safety for Ego Lane
-                    # Blind-Mode: raise MANEUVER_GAP from 25m to 35m
+                    # Blind-Mode: raise MANEUVER_GAP from 25m to 30m
                     is_closing_fast = v["rel_speed_kmh"] > 10.0
-                    base_gap = 35.0 if is_blind_mode else 25.0
+                    base_gap = 30.0 if is_blind_mode else 25.0
                     gap_threshold = 30.0 if is_closing_fast else base_gap
 
                     enriched.append({
@@ -392,8 +453,8 @@ def run(video_path, cfg):
                             for v in enriched
                         )
                         if overtake_lane_occupied:
-                            # Force UNSAFE — no 'Safe to Overtake' allowed
-                            last_safety = SafetyLevel.UNSAFE
+                            # Force RISKY (CAUTION) instead of UNSAFE to reduce panicky behavior
+                            last_safety = SafetyLevel.RISKY
                             last_reason = "CAUTION | Blind Driving | Reduced Confidence"
                         else:
                             # Cap SAFE → CAUTION when lane lines are missing
@@ -440,7 +501,10 @@ def run(video_path, cfg):
 
         # FPS sync
         elapsed = time.time() - loop_start
-        wait_ms = max(1, int((frame_delay - elapsed) * 1000))
+        if isinstance(video_path, int):
+            wait_ms = 1  # Live camera controls its own framerate (no artificial delay needed)
+        else:
+            wait_ms = max(1, int((frame_delay - elapsed) * 1000))
         key = cv2.waitKey(wait_ms) & 0xFF
 
         if key in [ord("q"), ord("Q"), 27]:
@@ -500,22 +564,35 @@ if __name__ == "__main__":
 
 # main.py ke bottom block ko isse replace karein
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cam', type=int, help='Directly start with Camera index (e.g. 1 or 2)')
+    args = parser.parse_args()
+
     cfg = Config()
     print("=" * 55)
     print("  YOLOPv2 Overtaking Safety System - LIVE")
     print("=" * 55)
 
-    mode = input("Choose Mode: [1] Video File | [2] Laptop Cam | [3] Phone Cam: ")
-
-    if mode == '1':
-        video = select_video(cfg) # Purana file selection
-    elif mode == '2':
-        video = cfg.CAMERA_SOURCE # Index 0 use hoga
-    elif mode == '3':
-        video = input("Enter Phone IP URL (e.g., http://192.168.1.5:8080/video): ")
+    if args.cam is not None:
+        video = args.cam
     else:
-        print("Invalid choice. Exiting.")
-        sys.exit()
+        mode = input("Choose Mode: [1] Video File | [2] Laptop Cam | [3] Phone Cam (DroidCam/Iriun): ")
+
+        if mode == '1':
+            video = select_video(cfg) # Purana file selection
+        elif mode == '2':
+            video = 0 # Laptop cam is usually 0
+        elif mode == '3':
+            # Phone connected via USB/Wi-Fi using DroidCam/Iriun appears as a local camera (index 1 or 2)
+            cam_idx = input("Enter Phone Camera Index (Usually 1 or 2, default is 1): ")
+            try:
+                video = int(cam_idx)
+            except ValueError:
+                print("Invalid input, defaulting to index 1.")
+                video = 1
+        else:
+            print("Invalid choice. Exiting.")
+            sys.exit()
 
     if video is not None:
         # run() function int aur string dono handle karta hai

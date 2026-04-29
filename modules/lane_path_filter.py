@@ -31,10 +31,10 @@ class LanePathFilter:
     MODE_FALLBACK = "BLIND/FALLBACK"  # Absolute fallback (fixed ratios)
 
     # ── Blind-Mode tuning ─────────────────────────────────────
-    MEMORY_FRAMES = 30                # ~1 second at 30fps
-    WIDEN_PERCENT_PER_FRAME = 0.05    # 5% of original span per lost frame
-    CONFIDENCE_DECAY_RATE = 1.0 / 30  # Decays to 0.0 over MEMORY_FRAMES
-    BLIND_GAP_THRESHOLD = 35.0        # Raised from 25m when blind
+    MEMORY_FRAMES = 45                # Raised from 30 for smoother transition
+    WIDEN_PERCENT_PER_FRAME = 0.03    # 3% of original span per lost frame
+    CONFIDENCE_DECAY_RATE = 1.0 / 45  # Decays to 0.0 over MEMORY_FRAMES
+    BLIND_GAP_THRESHOLD = 30.0        # Reduced from 35m (safer but less panicky)
 
     def __init__(self, fallback_ego_ratio=0.50, fallback_right_ratio=0.75):
         # Fallback ratios (current hardcoded behavior)
