@@ -293,6 +293,7 @@ def run(video_path, cfg):
     last_safety = SafetyLevel.UNSAFE
     last_reason = "Initializing..."
     ego_spd = 0.0
+    safety_history = deque(maxlen=5)
     t_prev = time.time()
 
     # Check karein ki path string hai ya camera index (int)
@@ -429,21 +430,22 @@ def run(video_path, cfg):
                 critical_vehicles = [v for v in enriched if v.get("is_critical")]
                 too_close_ego = [v for v in enriched if v.get("is_too_close")]
 
+                # ── Safety Decision Logic (Raw) ──
                 if critical_vehicles:
-                    last_safety = SafetyLevel.UNSAFE
-                    last_reason = "CRITICAL | Brake Now"
+                    raw_safety = SafetyLevel.UNSAFE
+                    raw_reason = "CRITICAL | Brake Now"
                 elif not feasible:
-                    last_safety = SafetyLevel.UNSAFE
-                    last_reason = f"NO OVERTAKE | {reason}"
+                    raw_safety = SafetyLevel.UNSAFE
+                    raw_reason = f"NO OVERTAKE | {reason}"
                 elif ttc_dec.level == SafetyLevel.UNSAFE:
-                    last_safety = SafetyLevel.UNSAFE
-                    last_reason = ttc_dec.reason
+                    raw_safety = SafetyLevel.UNSAFE
+                    raw_reason = ttc_dec.reason
                 elif too_close_ego:
-                    last_safety = SafetyLevel.RISKY
-                    last_reason = "CAUTION | Gap too small for maneuver"
+                    raw_safety = SafetyLevel.RISKY
+                    raw_reason = "CAUTION | Gap too small for maneuver"
                 elif ttc_dec.level == SafetyLevel.RISKY:
-                    last_safety = SafetyLevel.RISKY
-                    last_reason = ttc_dec.reason
+                    raw_safety = SafetyLevel.RISKY
+                    raw_reason = ttc_dec.reason
                 else:
                     # ── Blind-Mode Strict Safety Override ───────────
                     if is_blind_mode:
@@ -453,16 +455,30 @@ def run(video_path, cfg):
                             for v in enriched
                         )
                         if overtake_lane_occupied:
-                            # Force RISKY (CAUTION) instead of UNSAFE to reduce panicky behavior
-                            last_safety = SafetyLevel.RISKY
-                            last_reason = "CAUTION | Blind Driving | Reduced Confidence"
+                            raw_safety = SafetyLevel.RISKY
+                            raw_reason = "CAUTION | Overtake Lane Occupied (Blind)"
                         else:
-                            # Cap SAFE → CAUTION when lane lines are missing
-                            last_safety = SafetyLevel.RISKY
-                            last_reason = "CAUTION | Blind Driving | Reduced Confidence"
+                            raw_safety = SafetyLevel.SAFE
+                            raw_reason = "SAFE | Blind Driving (Lines Lost)"
                     else:
-                        last_safety = SafetyLevel.SAFE
-                        last_reason = "SAFE TO OVERTAKE"
+                        raw_safety = SafetyLevel.SAFE
+                        raw_reason = "SAFE TO OVERTAKE"
+
+                # ── Temporal Smoothing (Anti-Flicker) ──
+                safety_history.append((raw_safety, raw_reason))
+
+                has_unsafe = any(s == SafetyLevel.UNSAFE for s, r in safety_history)
+                has_risky = any(s == SafetyLevel.RISKY for s, r in safety_history)
+
+                if has_unsafe:
+                    last_safety = SafetyLevel.UNSAFE
+                    last_reason = next(r for s, r in reversed(safety_history) if s == SafetyLevel.UNSAFE)
+                elif has_risky:
+                    last_safety = SafetyLevel.RISKY
+                    last_reason = next(r for s, r in reversed(safety_history) if s == SafetyLevel.RISKY)
+                else:
+                    last_safety = SafetyLevel.SAFE
+                    last_reason = raw_reason
 
                 estimator.cleanup({t["id"] for t in last_tracks})
 
@@ -501,10 +517,11 @@ def run(video_path, cfg):
 
         # FPS sync
         elapsed = time.time() - loop_start
-        if isinstance(video_path, int):
-            wait_ms = 1  # Live camera controls its own framerate (no artificial delay needed)
+        if isinstance(video_path, int) or cfg.TARGET_FPS == 0:
+            wait_ms = 1  # No artificial delay, run as fast as possible
         else:
-            wait_ms = max(1, int((frame_delay - elapsed) * 1000))
+            target_delay = 1.0 / cfg.TARGET_FPS
+            wait_ms = max(1, int((target_delay - elapsed) * 1000))
         key = cv2.waitKey(wait_ms) & 0xFF
 
         if key in [ord("q"), ord("Q"), 27]:

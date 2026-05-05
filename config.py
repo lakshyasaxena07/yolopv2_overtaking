@@ -52,7 +52,8 @@ class Config:
     MIN_OVERTAKE_CLEAR = 0.15       # 15% minimum clear area
 
     # ── Videos ─────────────────────────────────────────────────
-    VIDEOS_FOLDER    = "experiments/videos"
+    VIDEOS_FOLDER    = "E:\Minor 2\Most_Stable\Claude\Overtaking_safety\Test\Custom_videos"
+    # VIDEOS_FOLDER    = "E:\Minor 2\Most_Stable\Claude\yolopv2\experiments\videos"
 
     # ── Debug ──────────────────────────────────────────────────
     SHOW_EGO_SPEED       = True
