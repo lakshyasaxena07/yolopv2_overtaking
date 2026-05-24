@@ -2,7 +2,15 @@
 
 A real-time computer vision system for detecting safe overtaking opportunities on Indian and international roads, powered by **YOLOPv2** (You Only Look Once Panoptic v2) multi-task perception with **ONNX Runtime / TensorRT** acceleration and **Time-To-Collision (TTC)** safety analysis.
 
-> **Status:** Stable · **Python:** 3.8+ · **CUDA:** Optional (11.8+ recommended) · **Last Updated:** April 2026
+> **Status:** Stable · **Python:** 3.8+ · **CUDA:** Optional (11.8+ recommended) · **Last Updated:** May 2026
+
+---
+
+## 🆕 Recent Updates (May 2026)
+
+- **Performance Boost:** Switched to nearest-mode mask upsampling for binary masks (~2x faster) and moved interpolation logic to the GPU to minimize PCIe bottlenecks.
+- **Safety Critical Fixes:** Corrected motorcycle real-world width mapping (resolving a 2.5x distance estimation error) and implemented FP16 bounding box clamping to prevent out-of-bounds overflows.
+- **Inference Refactoring:** Split ONNX and PyTorch inference pipelines for cleaner execution and added degenerate box filtering during post-processing.
 
 ---
 

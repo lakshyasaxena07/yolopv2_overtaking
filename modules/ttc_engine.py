@@ -1,4 +1,11 @@
-# modules/ttc_engine.py — TTC Engine + Safety Decision
+# modules/ttc_engine.py — Kinematic TTC Safety Engine (Production)
+#
+# SAFETY-CRITICAL REDESIGN:
+# - Replaces static distance thresholds with physics-based TTC
+# - TTC = Distance / RelativeVelocity (per-vehicle, per-direction)
+# - Same-direction threshold: 4.0s (closing from behind)
+# - Oncoming threshold: 6.0s (head-on approach — higher due to combined velocity)
+# - Computes TTC for ALL relevant tracks, not just oncoming
 
 from dataclasses import dataclass
 from enum        import Enum
@@ -35,13 +42,22 @@ class SafetyDecision:
 
 class TTCEngine:
     """
-    Time-To-Collision based safety decision engine.
+    Kinematic Time-To-Collision Safety Engine.
 
-    Decision Logic:
-    1. Overtake feasibility check (road/barrier/vehicle)
-    2. Oncoming threat TTC calculation
-    3. Congestion check (too close vehicles)
-    4. Stable decision (5-frame history)
+    SAFETY-CRITICAL PHYSICS:
+    TTC = Distance / max(RelativeVelocity, 0.1)
+
+    At Ego=100km/h, Oncoming=80km/h:
+      Relative = 50 m/s, Distance = 300m → TTC = 6.0s → UNSAFE threshold
+      Old static gap (30m) would give 0.6s — lethal.
+
+    At Ego=100km/h, Same-dir Target=40km/h:
+      Relative = 16.67 m/s, Distance = 67m → TTC = 4.0s → UNSAFE threshold
+      Old static gap (25m) would give 1.5s — insufficient for human reaction.
+
+    Decision thresholds are direction-aware:
+    - Oncoming: TTC < 6.0s → UNSAFE (combined velocity = very fast closure)
+    - Same-direction: TTC < 4.0s → UNSAFE (lower relative velocity)
     """
 
     SIZE_PENALTY = {
@@ -53,11 +69,20 @@ class TTCEngine:
     }
 
     def __init__(self, cfg=None):
-        self.TTC_SAFE  = 5.0
-        self.TTC_RISKY = 2.5
-        self._history  = deque(maxlen=5)
+        # SAFETY-CRITICAL: Use direction-aware thresholds from config
+        self.TTC_UNSAFE_SAME_DIR = getattr(cfg, 'TTC_UNSAFE_SAME_DIR', 4.0)
+        self.TTC_UNSAFE_ONCOMING = getattr(cfg, 'TTC_UNSAFE_ONCOMING', 6.0)
+        self.TTC_RISKY_SAME_DIR  = self.TTC_UNSAFE_SAME_DIR + 2.0   # 6.0s
+        self.TTC_RISKY_ONCOMING  = self.TTC_UNSAFE_ONCOMING + 2.0   # 8.0s
+        self._history = deque(maxlen=5)
 
     def compute_ttc(self, distance_m, approach_rate_mps):
+        """
+        TTC = Distance / RelativeVelocity
+
+        SAFETY-CRITICAL: Floor approach_rate at 0.1 m/s to prevent division by zero.
+        Returns inf if vehicle is not approaching (stationary or moving away).
+        """
         if approach_rate_mps <= 0.1:
             return float("inf")
         return max(0.0, distance_m / approach_rate_mps)
@@ -65,14 +90,11 @@ class TTCEngine:
     def evaluate(self, enriched_tracks,
                  overtake_feasibility=None):
         """
-        Main evaluation function.
+        Main evaluation — computes per-vehicle TTC for ALL relevant tracks.
 
-        Args:
-            enriched_tracks     : list from estimator
-            overtake_feasibility: dict from lane_detector
-
-        Returns:
-            SafetyDecision
+        SAFETY-CRITICAL CHANGE: Old engine only computed TTC for oncoming threats.
+        Now computes TTC for same-direction vehicles too (rear-end collision risk).
+        Uses direction-aware thresholds (4.0s same-dir, 6.0s oncoming).
         """
 
         # ── Check 1: Overtake physically possible? ────────────
@@ -97,31 +119,39 @@ class TTCEngine:
             if t.get("is_relevant", True)
         ]
 
-        # ── Check 2: Oncoming threats ─────────────────────────
-        threats = [
-            t for t in relevant
-            if t.get("is_oncoming") and
-               t.get("approach_rate", 0) > 0.3
-        ]
+        # ── Compute per-vehicle TTC (ALL directions) ──────────
+        ttc_results = []
+        for t in relevant:
+            approach = t.get("approach_rate", 0)
+            if approach <= 0.1:
+                continue   # Not approaching — no TTC threat
 
-        # ── Check 3: Too close vehicles ───────────────────────
-        too_close_vehicles = [
-            t for t in relevant
-            if t.get("is_too_close")
-        ]
+            penalty = self.SIZE_PENALTY.get(t["class_name"], 1.1)
+            eff_approach = approach * penalty
+            ttc_val = self.compute_ttc(t["distance_m"], eff_approach)
 
-        # ── Check 4: Overtake lane blocked? ───────────────────
+            # Direction-aware threshold selection
+            is_oncoming = t.get("is_oncoming", False)
+            ttc_unsafe_thresh = self.TTC_UNSAFE_ONCOMING if is_oncoming else self.TTC_UNSAFE_SAME_DIR
+            ttc_risky_thresh  = self.TTC_RISKY_ONCOMING if is_oncoming else self.TTC_RISKY_SAME_DIR
+
+            ttc_results.append({
+                "ttc": ttc_val,
+                "track": t,
+                "is_oncoming": is_oncoming,
+                "ttc_unsafe_thresh": ttc_unsafe_thresh,
+                "ttc_risky_thresh": ttc_risky_thresh,
+            })
+
+        # ── Check: Overtake lane blocked? ─────────────────────
         overtake_blocked = any(
             t["zone"] == "overtake_lane" and
             t["distance_m"] < 30
             for t in relevant
         )
 
-        # ── All clear → SAFE ──────────────────────────────────
-        if (not threats and
-                not too_close_vehicles and
-                not overtake_blocked):
-
+        # ── All clear → SAFE ─────────────────────────────────
+        if not ttc_results and not overtake_blocked:
             if (overtake_feasibility and
                     overtake_feasibility["feasible"]):
                 safe_reason = (
@@ -142,56 +172,37 @@ class TTCEngine:
             self._history.append(decision)
             return decision
 
-        # ── TTC for oncoming threats ──────────────────────────
-        ttc_list = []
-        for t in threats:
-            penalty      = self.SIZE_PENALTY.get(
-                t["class_name"], 1.1)
-            eff_approach = t["approach_rate"] * penalty
-            ttc          = self.compute_ttc(
-                t["distance_m"], eff_approach)
-            ttc_list.append((ttc, t))
+        # ── Evaluate TTC threats ──────────────────────────────
+        unsafe_threats = [r for r in ttc_results if r["ttc"] < r["ttc_unsafe_thresh"]]
+        risky_threats  = [r for r in ttc_results if r["ttc"] < r["ttc_risky_thresh"]]
 
-        if ttc_list:
-            ttc_list.sort(key=lambda x: x[0])
-            min_ttc, worst = ttc_list[0]
-            closest_dist   = worst["distance_m"]
-            closing_kph    = worst["approach_rate"] * 3.6
+        # Find worst-case values for reporting
+        if ttc_results:
+            ttc_results.sort(key=lambda r: r["ttc"])
+            min_ttc = ttc_results[0]["ttc"]
+            worst = ttc_results[0]["track"]
+            closest_dist = worst["distance_m"]
+            closing_kph = worst.get("approach_rate", 0) * 3.6
         else:
-            min_ttc      = float("inf")
+            min_ttc = float("inf")
             closest_dist = 999.0
-            closing_kph  = 0.0
+            closing_kph = 0.0
 
-        num_threats = len(threats)
+        num_threats = len(unsafe_threats) + len(risky_threats)
 
-        # ── UNSAFE conditions ─────────────────────────────────
-        unsafe = (
-            (min_ttc < self.TTC_RISKY) or
-            (closest_dist < 40.0) or
-            (num_threats >= 2) or
-            (len(too_close_vehicles) >= 2)
-        )
-
-        # ── RISKY conditions ──────────────────────────────────
-        risky = (
-            (min_ttc < self.TTC_SAFE) or
-            (closest_dist < 80.0) or
-            overtake_blocked or
-            (len(too_close_vehicles) >= 1)
-        )
-
-        if unsafe:
+        # ── UNSAFE conditions (any single vehicle below UNSAFE threshold) ──
+        if unsafe_threats or len(risky_threats) >= 3:
             level  = SafetyLevel.UNSAFE
             reason = self._build_reason(
-                min_ttc, closest_dist, num_threats,
-                too_close_vehicles, overtake_blocked,
+                min_ttc, closest_dist, len(unsafe_threats),
+                risky_threats, overtake_blocked,
                 "CRITICAL"
             )
-        elif risky:
+        elif risky_threats or overtake_blocked:
             level  = SafetyLevel.RISKY
             reason = self._build_reason(
-                min_ttc, closest_dist, num_threats,
-                too_close_vehicles, overtake_blocked,
+                min_ttc, closest_dist, len(unsafe_threats),
+                risky_threats, overtake_blocked,
                 "CAUTION"
             )
         else:
@@ -224,17 +235,17 @@ class TTCEngine:
                         return d
         return self._history[-1]
 
-    def _build_reason(self, ttc, dist, threats,
-                      too_close, blocked, tag):
+    def _build_reason(self, ttc, dist, unsafe_count,
+                      risky_threats, blocked, tag):
         parts = [tag]
         if ttc < 999:
             parts.append(f"TTC:{ttc:.1f}s")
         if dist < 999:
             parts.append(f"Dist:{dist:.0f}m")
-        if threats > 0:
-            parts.append(f"Oncoming:{threats}")
-        if too_close:
-            parts.append(f"TooClose:{len(too_close)}")
+        if unsafe_count > 0:
+            parts.append(f"Threats:{unsafe_count}")
+        if risky_threats:
+            parts.append(f"Risky:{len(risky_threats)}")
         if blocked:
             parts.append("OvertakeLaneBlocked")
         return "  |  ".join(parts)

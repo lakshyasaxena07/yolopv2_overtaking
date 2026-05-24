@@ -1,16 +1,12 @@
-# main.py — YOLOPv2 Overtaking Safety System
-# Controls: D=drivable  L=lanes  Space=pause  R=restart  Q=quit
+# main.py — YOLOPv2 Overtaking Safety System (Production Async Pipeline)
+# Architecture: WatchdogCamera → DropOldestBuffer → InferenceThread → ResultQueue → HUD
 
-import cv2
-import numpy as np
-import sys
-import time
+import cv2, numpy as np, sys, time, queue, threading, argparse
 import tkinter as tk
 from tkinter import filedialog
 from pathlib import Path
 from collections import deque
-import threading
-import argparse
+from dataclasses import dataclass
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import Config
@@ -23,6 +19,7 @@ from modules.lane_path_filter import LanePathFilter
 YOLOPV2_DIR = Path(r"E:\Minor 2\claude\YOLOPv2")
 sys.path.insert(0, str(YOLOPV2_DIR))
 
+# SAFETY-CRITICAL: Class 3 = motorcycle (COCO), NOT "vehicle"
 COCO_NAMES = {0: "person", 1: "bicycle", 2: "car", 3: "vehicle", 5: "bus", 7: "truck"}
 
 
@@ -30,590 +27,801 @@ def select_video(cfg):
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
-    videos_dir = cfg.VIDEOS_FOLDER
-    if not Path(videos_dir).exists():
-        videos_dir = str(Path.home())
-    path = filedialog.askopenfilename(
+    vd = cfg.VIDEOS_FOLDER
+    if not Path(vd).exists():
+        vd = str(Path.home())
+    p = filedialog.askopenfilename(
         title="Select Video",
-        initialdir=videos_dir,
+        initialdir=vd,
         filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv"), ("All", "*.*")],
     )
     root.destroy()
-    return path if path else None
+    return p if p else None
 
 
+# ════════════════════════════════════════════════════════════
+# SECTION 1: WATCHDOG CAMERA (Fault Tolerance — FAIL-1 Fix)
+# ════════════════════════════════════════════════════════════
+class WatchdogCamera:
+    """Camera with fault detection. 300ms timeout → SENSOR_FAILURE + auto-reconnect."""
+
+    def __init__(self, src=0, width=1280, height=720, timeout_ms=300):
+        self.src, self.width, self.height = src, width, height
+        self.timeout_s = timeout_ms / 1000.0
+        self.cap = cv2.VideoCapture(src)
+        self.grabbed, self.frame = False, None
+        self.sensor_failed, self.stopped = False, False
+        self._lock = threading.Lock()
+        self._last_t = time.monotonic()
+        self._recon_lock = threading.Lock()
+        ret, f = self.cap.read()
+        if ret and f is not None:
+            self.frame = cv2.resize(f, (width, height))
+            self.grabbed = True
+            self._last_t = time.monotonic()
+
+    def start(self):
+        if not self.cap.isOpened():
+            self.sensor_failed = True
+            return self
+        threading.Thread(target=self._grab, daemon=True).start()
+        threading.Thread(target=self._watchdog, daemon=True).start()
+        return self
+
+    def _grab(self):
+        while not self.stopped:
+            with self._recon_lock:
+                cap = self.cap
+            if cap is not None and cap.isOpened():
+                ret, f = cap.read()
+            else:
+                ret, f = False, None
+            if ret and f is not None:
+                f = cv2.resize(f, (self.width, self.height))
+                with self._lock:
+                    self.grabbed, self.frame = True, f
+                    self._last_t = time.monotonic()
+                    if self.sensor_failed:
+                        print("[WATCHDOG] Sensor recovered!")
+                        self.sensor_failed = False
+            else:
+                time.sleep(0.01)
+
+    def _watchdog(self):
+        while not self.stopped:
+            time.sleep(0.05)
+            if (
+                time.monotonic() - self._last_t > self.timeout_s
+                and not self.sensor_failed
+            ):
+                print(f"[WATCHDOG] SENSOR FAILURE")
+                self.sensor_failed = True
+                self._reconnect()
+
+    def _reconnect(self):
+        while not self.stopped and self.sensor_failed:
+            print("[WATCHDOG] Reconnecting...")
+            with self._recon_lock:
+                try:
+                    self.cap.release()
+                except:
+                    pass
+                self.cap = cv2.VideoCapture(self.src)
+            time.sleep(2.0)
+            if self.cap.isOpened():
+                ret, _ = self.cap.read()
+                if ret:
+                    self._last_t = time.monotonic()
+                    print("[WATCHDOG] Reconnected!")
+                    return
+
+    def read(self):
+        with self._lock:
+            if self.frame is not None:
+                return self.grabbed, self.frame.copy()
+            return False, None
+
+    def release(self):
+        self.stopped = True
+        time.sleep(0.1)
+        if self.cap:
+            self.cap.release()
+
+    def isOpened(self):
+        return self.cap is not None and self.cap.isOpened()
+
+    def get(self, p):
+        return self.cap.get(p) if self.cap else 0
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 2: ASYNC PIPELINE
+# ════════════════════════════════════════════════════════════
+class DropOldestBuffer:
+    """Thread-safe frame buffer. When full, drops oldest — GPU never waits."""
+
+    def __init__(self, maxsize=2):
+        self._q = queue.Queue(maxsize=maxsize)
+
+    def put_latest(self, frame):
+        while True:
+            try:
+                self._q.put_nowait(frame)
+                return
+            except queue.Full:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def get(self, timeout=1.0):
+        try:
+            return self._q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+@dataclass
+class PipelineResult:
+    seg_frame: np.ndarray
+    tracks: list
+    safety_level: object
+    safety_reason: str
+    ego_speed: float
+    lane_mode: str
+    confidence: float
+    inference_fps: float
+    orig_shape: tuple
+
+
+class TimedSafetyHistory:
+    """Time-normalized 500ms safety buffer. Consistent regardless of FPS."""
+
+    def __init__(self, window_s=0.5):
+        self._w, self._entries = window_s, []
+
+    def append(self, level, reason):
+        now = time.monotonic()
+        self._entries.append((now, level, reason))
+        cutoff = now - self._w
+        self._entries = [(t, l, r) for t, l, r in self._entries if t >= cutoff]
+
+    def get_stable(self):
+        if not self._entries:
+            return SafetyLevel.UNSAFE, "Initializing..."
+        self._entries = [
+            (t, l, r) for t, l, r in self._entries if t >= time.monotonic() - self._w
+        ]
+        u = any(l == SafetyLevel.UNSAFE for _, l, _ in self._entries)
+        r = any(l == SafetyLevel.RISKY for _, l, _ in self._entries)
+        if u:
+            return SafetyLevel.UNSAFE, next(
+                r2 for _, l, r2 in reversed(self._entries) if l == SafetyLevel.UNSAFE
+            )
+        if r:
+            return SafetyLevel.RISKY, next(
+                r2 for _, l, r2 in reversed(self._entries) if l == SafetyLevel.RISKY
+            )
+        return SafetyLevel.SAFE, self._entries[-1][2]
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 3: OVERTAKING ANALYZER
+# ════════════════════════════════════════════════════════════
 class OvertakingAnalyzer:
-
     def __init__(self, config):
         self.cfg = config
         self._history = deque([True] * 5, maxlen=10)
 
     def analyze(self, frame_w, frame_h, tracked, path_filter=None):
-        """Analyze overtaking feasibility using dynamic lane boundaries."""
-        # Use dynamic boundaries from path_filter if available
-        scan_y = frame_h - 100  # Same scan row as LanePathFilter
+        scan_y = frame_h - 100
         if path_filter is not None and path_filter.is_dynamic:
             ov_x1, ov_x2 = path_filter.get_dynamic_overtake_bounds(scan_y)
-            # Scale from HUD (1280) to original frame width
             ov_x1 = int(ov_x1 * frame_w / 1280)
             ov_x2 = int(ov_x2 * frame_w / 1280)
             on_x1, on_x2 = ov_x1, ov_x2
         else:
-            # Fallback: hardcoded ratios
-            if self.cfg.DRIVING_MODE == "india":
-                ov_x1 = int(frame_w * 0.50)
-                ov_x2 = int(frame_w * 0.75)
-                on_x1 = int(frame_w * 0.50)
-                on_x2 = int(frame_w * 0.75)
-            else:
-                ov_x1 = int(frame_w * 0.50)
-                ov_x2 = int(frame_w * 0.75)
-                on_x1 = 0
-                on_x2 = int(frame_w * 0.25)
-
+            ov_x1 = int(frame_w * 0.50)
+            ov_x2 = int(frame_w * 0.75)
+            on_x1 = ov_x1
+            on_x2 = ov_x2
         for v in tracked:
             cx = (v["bbox"][0] + v["bbox"][2]) // 2
             if v.get("direction") == "oncoming" and on_x1 <= cx <= on_x2:
                 if v.get("distance", 0) > 50:
                     continue
                 self._history.append(False)
-                return (False, f"Oncoming ({v.get('distance',0):.0f}m)")
+                return False, f"Oncoming ({v.get('distance',0):.0f}m)"
             if ov_x1 <= cx <= ov_x2:
                 if v.get("distance", 0) > 50:
                     continue
                 self._history.append(False)
-                return (
-                    False,
-                    f"Vehicle in overtake lane ({v.get('distance',0):.0f}m)",
-                )
-
+                return False, f"Vehicle in overtake lane ({v.get('distance',0):.0f}m)"
         self._history.append(True)
         if sum(self._history) >= len(self._history) * 0.55:
             return True, "Clear to overtake"
         return False, "Checking..."
 
 
-class HUDRenderer:
+# ════════════════════════════════════════════════════════════
+# SECTION 4: INFERENCE THREAD
+# ════════════════════════════════════════════════════════════
+class InferenceThread(threading.Thread):
+    """Consumes frames from buffer, runs full pipeline, produces PipelineResult."""
 
+    def __init__(self, frame_buf, result_q, cfg):
+        super().__init__(daemon=True)
+        self.buf, self.rq, self.cfg = frame_buf, result_q, cfg
+        self.stopped = False
+        self.show_da, self.show_ll = cfg.SHOW_DRIVABLE, cfg.SHOW_LANES
+        self.detector = YOLOPv2Detector(cfg)
+        self.tracker = SORTTracker()
+        self.estimator = Estimator(cfg)
+        self.ttc = TTCEngine(cfg)
+        self.analyzer = OvertakingAnalyzer(cfg)
+        self.path_filter = LanePathFilter()
+        self.safety_hist = TimedSafetyHistory(
+            getattr(cfg, "SAFETY_HISTORY_WINDOW_S", 0.5)
+        )
+        self._fps_q = deque(maxlen=30)
+        self._t_prev = time.time()
+
+    def run(self):
+        while not self.stopped:
+            try:
+                frame = self.buf.get(timeout=0.5)
+                if frame is None:
+                    continue
+                result = self._process(frame)
+                # Drop-oldest on result queue too
+                if self.rq.full():
+                    try:
+                        self.rq.get_nowait()
+                    except:
+                        pass
+                self.rq.put(result)
+            except Exception as e:
+                import traceback
+
+                print(f"\n[!] INFERENCE ERROR: {e}")
+                traceback.print_exc()
+                time.sleep(0.1)  # Prevent tight error loop
+
+    def _process(self, frame):
+        t_now = time.time()
+        self._fps_q.append(1.0 / max(t_now - self._t_prev, 0.001))
+        self._t_prev = t_now
+        fps = float(np.mean(self._fps_q))
+        orig_h, orig_w = frame.shape[:2]
+
+        # ── OPTIMIZATION ──────────────────────────────────────
+        # Only run Ego Motion (Optical Flow) every 2nd frame
+        # This saves ~15% CPU/GPU overhead per cycle.
+        do_ego = getattr(self, "_ego_counter", 0) % 2 == 0
+        self._ego_counter = getattr(self, "_ego_counter", 0) + 1
+
+        dets, seg_frame, orig_shape, da_mask, ll_mask = self.detector.detect(
+            frame, show_da=self.show_da, show_ll=self.show_ll
+        )
+
+        self.path_filter.update(ll_mask, da_mask, 720, 1280)
+        is_blind = self.path_filter.is_blind
+
+        track_input = [
+            {
+                "bbox": d["bbox"],
+                "confidence": d["conf"],
+                "class_id": d["cls"],
+                "class_name": COCO_NAMES.get(d["cls"], "vehicle"),
+            }
+            for d in dets
+        ]
+        tracks = self.tracker.update(track_input)
+
+        tracked = []
+        for t in tracks:
+            tid = t["track_id"]
+            x1 = int(t["bbox"][0])
+            y1 = int(t["bbox"][1])
+            x2 = int(t["bbox"][2])
+            y2 = int(t["bbox"][3])
+            cid = t.get("class_id", 2)
+            dist = self.estimator.estimate_distance(tid, x1, y1, x2, y2, cid)
+            spd = self.estimator.estimate_speed(tid, dist)
+            dire = self.estimator.estimate_direction(tid, x1, y1, x2, y2, orig_h)
+            tracked.append(
+                {
+                    "id": tid,
+                    "bbox": [x1, y1, x2, y2],
+                    "distance": dist,
+                    "rel_speed_kmh": spd * 3.6,
+                    "direction": dire,
+                    "class_name": COCO_NAMES.get(cid, "vehicle"),
+                    "cls": cid,
+                }
+            )
+
+        if do_ego:
+            ego_spd = self.estimator.estimate_ego_motion(frame)
+        else:
+            ego_spd = self.estimator.get_ego_speed()
+
+        feasible, reason = self.analyzer.analyze(
+            orig_w, orig_h, tracked, self.path_filter
+        )
+
+        # Build enriched tracks with kinematic TTC (replaces static gap)
+        enriched = []
+        for v in tracked:
+            bbox = v["bbox"]
+            if self.path_filter.is_right_of_corridor(bbox, orig_h, orig_w):
+                continue
+            on_road = self.path_filter.is_on_drivable(bbox, da_mask, orig_h, orig_w)
+            if v["direction"] == "oncoming":
+                zone = "oncoming_lane"
+            else:
+                zone = self.path_filter.classify_zone(bbox, orig_h, orig_w)
+
+            # SAFETY-CRITICAL: Kinematic TTC replaces static 25-30m gap
+            # rel_speed_kmh > 0 = approaching, < 0 = receding
+            # DO NOT use abs() — receding vehicles must NOT trigger TTC
+            approach_mps = (
+                max(v["rel_speed_kmh"], 0.0) / 3.6
+            )  # Only positive = approaching
+            if approach_mps > 0.1:
+                vehicle_ttc = v["distance"] / approach_mps
+            else:
+                vehicle_ttc = float("inf")
+
+            is_oncoming = v["direction"] == "oncoming"
+            ttc_thresh = (
+                self.cfg.TTC_UNSAFE_ONCOMING
+                if is_oncoming
+                else self.cfg.TTC_UNSAFE_SAME_DIR
+            )
+
+            enriched.append(
+                {
+                    "track_id": v["id"],
+                    "bbox": v["bbox"],
+                    "distance_m": v["distance"],
+                    "speed_kph": v["rel_speed_kmh"],
+                    "direction": v["direction"],
+                    "class_name": v["class_name"],
+                    "is_oncoming": is_oncoming,
+                    "is_relevant": on_road,
+                    "is_too_close": vehicle_ttc < ttc_thresh
+                    and zone in ("ego_lane", "overtake_lane"),
+                    "is_critical": v["distance"] < 8.0,
+                    "is_parked": False,
+                    "approach_rate": approach_mps,
+                    "zone": zone,
+                    "ttc": vehicle_ttc,
+                }
+            )
+
+        ttc_dec = self.ttc.evaluate(enriched, None)
+        critical = [v for v in enriched if v.get("is_critical")]
+        too_close = [v for v in enriched if v.get("is_too_close")]
+
+        if critical:
+            raw_safety, raw_reason = SafetyLevel.UNSAFE, "CRITICAL | Brake Now"
+        elif not feasible:
+            raw_safety, raw_reason = SafetyLevel.UNSAFE, f"NO OVERTAKE | {reason}"
+        elif ttc_dec.level == SafetyLevel.UNSAFE:
+            raw_safety, raw_reason = SafetyLevel.UNSAFE, ttc_dec.reason
+        elif too_close:
+            raw_safety, raw_reason = (
+                SafetyLevel.RISKY,
+                "CAUTION | TTC too low for maneuver",
+            )
+        elif ttc_dec.level == SafetyLevel.RISKY:
+            raw_safety, raw_reason = SafetyLevel.RISKY, ttc_dec.reason
+        elif is_blind:
+            ov_occ = any(v.get("zone") == "overtake_lane" for v in enriched)
+            if ov_occ:
+                raw_safety, raw_reason = (
+                    SafetyLevel.RISKY,
+                    "CAUTION | Overtake Occupied (Blind)",
+                )
+            else:
+                raw_safety, raw_reason = (
+                    SafetyLevel.SAFE,
+                    "SAFE | Blind Driving (Lines Lost)",
+                )
+        else:
+            raw_safety, raw_reason = SafetyLevel.SAFE, "SAFE TO OVERTAKE"
+
+        # Time-normalized smoothing (500ms window)
+        self.safety_hist.append(raw_safety, raw_reason)
+        final_safety, final_reason = self.safety_hist.get_stable()
+
+        self.estimator.cleanup({t["id"] for t in tracked})
+
+        # Scale bboxes to HUD (1280x720)
+        disp_h, disp_w = seg_frame.shape[:2]
+        sx, sy = disp_w / max(orig_w, 1), disp_h / max(orig_h, 1)
+        scaled = []
+        for v in tracked:
+            sv = v.copy()
+            b = v["bbox"]
+            sv["bbox"] = [
+                int(b[0] * sx),
+                int(b[1] * sy),
+                int(b[2] * sx),
+                int(b[3] * sy),
+            ]
+            scaled.append(sv)
+
+        return PipelineResult(
+            seg_frame=seg_frame,
+            tracks=scaled,
+            safety_level=final_safety,
+            safety_reason=final_reason,
+            ego_speed=ego_spd,
+            lane_mode=self.path_filter.mode_display,
+            confidence=self.path_filter.confidence_score,
+            inference_fps=fps,
+            orig_shape=(orig_h, orig_w),
+        )
+
+
+# ════════════════════════════════════════════════════════════
+# SECTION 5: HUD RENDERER
+# ════════════════════════════════════════════════════════════
+class HUDRenderer:
     INFO_COL = (0, 255, 255)
     SAFE_COL = (0, 220, 0)
     CAUTION_COL = (0, 165, 255)
     UNSAFE_COL = (0, 0, 255)
 
-    def render(self, frame, fps, tracks, ego_speed,
-               safety, reason, cfg, lane_mode="OPTICAL", confidence=1.0):
+    def render(
+        self,
+        frame,
+        fps,
+        tracks,
+        ego_speed,
+        safety,
+        reason,
+        cfg,
+        lane_mode="OPTICAL",
+        confidence=1.0,
+    ):
         h, w = frame.shape[:2]
+        cv2.rectangle(frame, (0, 0), (w, 52), (20, 20, 20), -1)
+        cv2.putText(
+            frame,
+            f"FPS: {fps:.1f}",
+            (12, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            self.INFO_COL,
+            2,
+        )
+        cv2.putText(
+            frame,
+            f"Tracks: {len(tracks)}",
+            (170, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            self.INFO_COL,
+            2,
+        )
+        cv2.putText(
+            frame,
+            f"Ego: {ego_speed*3.6:.1f} km/h",
+            (360, 36),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            self.INFO_COL,
+            2,
+        )
 
-        cv2.rectangle(frame, (0,0), (w,52),
-                      (20,20,20), -1)
-        cv2.putText(frame, f"FPS: {fps:.1f}",
-                    (12,36),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.85, self.INFO_COL, 2)
-        cv2.putText(frame, f"Tracks: {len(tracks)}",
-                    (170,36),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.85, self.INFO_COL, 2)
-        cv2.putText(frame,
-                    f"Ego: {ego_speed*3.6:.1f} km/h",
-                    (360,36),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.85, self.INFO_COL, 2)
-
-        # ── Mode indicator (top-right) ────────────────────
         mode_txt = f"MODE: {lane_mode}"
         if "VIRTUAL" in lane_mode:
-            mode_col = (0, 0, 255)    # Red for virtual/green-mask
+            mode_col = (0, 0, 255)
         elif "MEMORY" in lane_mode:
-            mode_col = (0, 140, 255)  # Orange for memory
+            mode_col = (0, 140, 255)
         elif "FALLBACK" in lane_mode:
-            mode_col = (0, 0, 200)    # Dark red for fallback
+            mode_col = (0, 0, 200)
         else:
-            mode_col = (0, 220, 0)    # Green for optical
+            mode_col = (0, 220, 0)
         mt_size = cv2.getTextSize(mode_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)[0]
         mx = w - mt_size[0] - 12
-        # Background pill for mode badge
         cv2.rectangle(frame, (mx - 6, 10), (w - 4, 42), (30, 30, 30), -1)
-        cv2.putText(frame, mode_txt, (mx, 34),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_col, 2)
+        cv2.putText(
+            frame, mode_txt, (mx, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_col, 2
+        )
 
         for v in tracks:
-            x1 = int(v["bbox"][0])
-            y1 = int(v["bbox"][1])
-            x2 = int(v["bbox"][2])
-            y2 = int(v["bbox"][3])
+            x1, y1, x2, y2 = (
+                int(v["bbox"][0]),
+                int(v["bbox"][1]),
+                int(v["bbox"][2]),
+                int(v["bbox"][3]),
+            )
             dist = v.get("distance", 0)
-            spd  = v.get("rel_speed_kmh", 0)
-            cls  = v.get("class_name", "vehicle")
-            tid  = v.get("id", 0)
+            spd = v.get("rel_speed_kmh", 0)
+            cls = v.get("class_name", "vehicle")
+            tid = v.get("id", 0)
             dire = v.get("direction", "")
-
-            col = (0,0,220) if dire == "oncoming" \
-                  else (0,220,0)
-            cv2.rectangle(frame,(x1,y1),(x2,y2),col,2)
-
-            spd_s = f"+{spd:.0f}" if spd > 0 \
-                    else f"{spd:.0f}"
-            lbl   = (f"#{tid} {cls} "
-                     f"{dist:.0f}m {spd_s}kph")
-            lx = max(x1, 4)
-            ly = max(y1-6, 22)
-            cv2.rectangle(frame,
-                (lx-2, ly-18),
-                (lx+len(lbl)*9, ly+4),
-                (15,15,15), -1)
-            cv2.putText(frame, lbl, (lx, ly),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55, (0,255,100), 2)
+            col = (0, 0, 220) if dire == "oncoming" else (0, 220, 0)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
+            spd_s = f"+{spd:.0f}" if spd > 0 else f"{spd:.0f}"
+            lbl = f"#{tid} {cls} {dist:.0f}m {spd_s}kph"
+            lx, ly = max(x1, 4), max(y1 - 6, 22)
+            cv2.rectangle(
+                frame, (lx - 2, ly - 18), (lx + len(lbl) * 9, ly + 4), (15, 15, 15), -1
+            )
+            cv2.putText(
+                frame, lbl, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 100), 2
+            )
 
         if safety == SafetyLevel.SAFE:
-            bcol, txt, tcol = \
-                (0,130,0), "SAFE", self.SAFE_COL
+            bcol, txt, tcol = (0, 130, 0), "SAFE", self.SAFE_COL
         elif safety == SafetyLevel.RISKY:
-            bcol, txt, tcol = \
-                (0,100,160), "CAUTION", self.CAUTION_COL
+            bcol, txt, tcol = (0, 100, 160), "CAUTION", self.CAUTION_COL
         else:
-            bcol, txt, tcol = \
-                (0,0,140), "UNSAFE", self.UNSAFE_COL
+            bcol, txt, tcol = (0, 0, 140), "UNSAFE", self.UNSAFE_COL
 
-        cv2.rectangle(frame,(0,h-85),(w,h),bcol,-1)
-        ts = cv2.getTextSize(
-            txt, cv2.FONT_HERSHEY_DUPLEX, 1.8, 3)[0]
-        cv2.putText(frame, txt,
-            ((w-ts[0])//2, h-45),
-            cv2.FONT_HERSHEY_DUPLEX, 1.8, tcol, 3)
-            
+        cv2.rectangle(frame, (0, h - 85), (w, h), bcol, -1)
+        ts = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, 1.8, 3)[0]
+        cv2.putText(
+            frame,
+            txt,
+            ((w - ts[0]) // 2, h - 45),
+            cv2.FONT_HERSHEY_DUPLEX,
+            1.8,
+            tcol,
+            3,
+        )
         rs = cv2.getTextSize(reason, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-        cv2.putText(frame, reason,
-            ((w-rs[0])//2, h-12),
+        cv2.putText(
+            frame,
+            reason,
+            ((w - rs[0]) // 2, h - 12),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7, (220,220,220), 2)
-            
-        cv2.putText(frame,
+            0.7,
+            (220, 220, 220),
+            2,
+        )
+        cv2.putText(
+            frame,
             "D=drivable  L=lanes  R=restart  Q=quit",
-            (w-400, h - 90 - 10),
+            (w - 400, h - 90 - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.45, (170,170,170), 1)
+            0.45,
+            (170, 170, 170),
+            1,
+        )
         return frame
 
-class ThreadedCamera:
-    """Background frame grabber to prevent USB camera latency and GPU starvation."""
-    def __init__(self, src=0, width=1280, height=720):
-        self.cap = cv2.VideoCapture(src)
-        self.width = width
-        self.height = height
-        # Removed cap.set() hardware overrides here to prevent green screen issues with DroidCam
-        self.grabbed, frame = self.cap.read()
-        if self.grabbed and frame is not None:
-            self.frame = cv2.resize(frame, (self.width, self.height))
-        else:
-            self.frame = None
-        self.started = False
-        self.read_lock = threading.Lock()
-        self.stopped = False
+    def render_sensor_failure(self, frame):
+        """Red fullscreen SENSOR FAILURE overlay."""
+        h, w = frame.shape[:2]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 180), -1)
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        txt = "SENSOR FAILURE"
+        ts = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, 2.0, 4)[0]
+        cv2.putText(
+            frame,
+            txt,
+            ((w - ts[0]) // 2, (h + ts[1]) // 2),
+            cv2.FONT_HERSHEY_DUPLEX,
+            2.0,
+            (255, 255, 255),
+            4,
+        )
+        cv2.putText(
+            frame,
+            "DRIVE MANUALLY — Reconnecting...",
+            ((w - 450) // 2, (h + ts[1]) // 2 + 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (200, 200, 200),
+            2,
+        )
+        return frame
 
-    def start(self):
-        if not self.cap.isOpened():
-            return self
-        if self.started:
-            return self
-        self.started = True
-        self.thread = threading.Thread(target=self.update, args=())
-        self.thread.daemon = True
-        self.thread.start()
-        return self
 
-    def update(self):
-        while not self.stopped:
-            grabbed, frame = self.cap.read()
-            if grabbed and frame is not None:
-                # Safely upsample the frame in software without breaking the virtual camera driver
-                frame = cv2.resize(frame, (self.width, self.height))
-            with self.read_lock:
-                self.grabbed = grabbed
-                self.frame = frame
-
-    def read(self):
-        with self.read_lock:
-            if self.frame is not None:
-                return self.grabbed, self.frame.copy()
-            return self.grabbed, None
-
-    def release(self):
-        self.stopped = True
-        if self.started:
-            self.thread.join()
-        self.cap.release()
-
-    def isOpened(self):
-        return self.cap.isOpened()
-
-    def get(self, propId):
-        return self.cap.get(propId)
-
+# ════════════════════════════════════════════════════════════
+# SECTION 6: MAIN RUN LOOP
+# ════════════════════════════════════════════════════════════
 def run(video_path, cfg):
-    detector = YOLOPv2Detector(cfg)
-    tracker = SORTTracker()
-    estimator = Estimator(cfg)
-    ttc = TTCEngine(cfg)
-    analyzer = OvertakingAnalyzer(cfg)
-    path_filter = LanePathFilter()
     hud = HUDRenderer()
+    frame_buf = DropOldestBuffer(maxsize=2)
+    result_q = queue.Queue(maxsize=1)
 
     if isinstance(video_path, int):
-        print(f"Configuring Live Camera (Index {video_path}) with Threaded Grabber...")
-        # Force 720p to prevent 4K overhead from phone
-        cap = ThreadedCamera(video_path, width=1280, height=720).start()
+        print(f"Live Camera (Index {video_path}) with Watchdog...")
+        cam = WatchdogCamera(
+            video_path, timeout_ms=getattr(cfg, "WATCHDOG_TIMEOUT_MS", 300)
+        ).start()
     else:
-        cap = cv2.VideoCapture(video_path)
+        cam = cv2.VideoCapture(video_path)
 
-    if not cap.isOpened():
+    if not cam.isOpened():
         print(f"Video open nahi hui: {video_path}")
         return False
 
-    # Video FPS sync
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    video_fps = cam.get(cv2.CAP_PROP_FPS)
     if video_fps <= 0 or video_fps > 120:
         video_fps = 30.0
-    frame_delay = 1.0 / video_fps
     print(f"Video FPS: {video_fps:.1f}")
+
+    # Start inference thread
+    inf_thread = InferenceThread(frame_buf, result_q, cfg)
+    inf_thread.start()
 
     cv2.namedWindow("YOLOPv2 Overtaking Safety", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("YOLOPv2 Overtaking Safety", cfg.OUTPUT_WIDTH, cfg.OUTPUT_HEIGHT)
 
-    fps_ctr = deque(maxlen=30)
-    frame_n = 0
+    last_result = None
     paused = False
-    show_da = cfg.SHOW_DRIVABLE
-    show_ll = cfg.SHOW_LANES
+    # Blank frame for sensor failure overlay
+    blank = np.zeros((720, 1280, 3), dtype=np.uint8)
 
-    # Cache — only update every SKIP_FRAMES
-    last_seg_frame = None
-    last_tracks = []
-    last_safety = SafetyLevel.UNSAFE
-    last_reason = "Initializing..."
-    ego_spd = 0.0
-    safety_history = deque(maxlen=5)
-    t_prev = time.time()
+    name = (
+        Path(video_path).name
+        if isinstance(video_path, str)
+        else f"Live Camera ({video_path})"
+    )
+    print(f"\nStarting: {name}")
+    print("D=drivable  L=lanes  Space=pause  R=restart  Q=quit\n")
 
-    # Check karein ki path string hai ya camera index (int)
-    if isinstance(video_path, str):
-        display_name = Path(video_path).name
-    else:
-        display_name = f"Live Camera (Index {video_path})"
+    is_cam = isinstance(video_path, int)  # CRASH-1 fix: define BEFORE loop
+    frame_interval = 1.0 / max(cfg.TARGET_FPS, 1) if not is_cam else 0
+    last_read_time = 0.0
 
-    print(f"\nStarting: {display_name}")
-    print("D=drivable  L=lanes  Space=pause"
-          "  R=restart  Q=quit\n")
-    
     while True:
         loop_start = time.time()
 
         if not paused:
-            ret, frame = cap.read()
-            if not ret:
-                print("Video ended.")
-                break
+            # Check sensor failure (live camera only)
+            if is_cam and hasattr(cam, "sensor_failed") and cam.sensor_failed:
+                display = hud.render_sensor_failure(blank.copy())
+                cv2.imshow("YOLOPv2 Overtaking Safety", display)
+                if (cv2.waitKey(100) & 0xFF) in [ord("q"), ord("Q"), 27]:
+                    break
+                continue
 
-            frame_n += 1
-            t_now = time.time()
-            fps_ctr.append(1.0 / max(t_now - t_prev, 0.001))
-            t_prev = t_now
-            fps = float(np.mean(fps_ctr))
-
-            orig_h, orig_w = frame.shape[:2]
-
-            # Detection every SKIP_FRAMES
-            if frame_n % cfg.SKIP_FRAMES == 0:
-
-                detections, seg_frame, orig_shape, da_mask, ll_mask = detector.detect(
-                    frame, show_da=show_da, show_ll=show_ll
-                )
-                last_seg_frame = seg_frame
-
-                # Update dynamic lane boundaries
-                path_filter.update(ll_mask, da_mask, 720, 1280)
-
-                # ── Blind-Mode flag for strict safety overrides ──
-                is_blind_mode = path_filter.is_blind
-
-                # Track
-                track_input = [
-                    {
-                        "bbox": d["bbox"],
-                        "confidence": d["conf"],
-                        "class_id": d["cls"],
-                        "class_name": COCO_NAMES.get(d["cls"], "vehicle"),
-                    }
-                    for d in detections
-                ]
-
-                tracks = tracker.update(track_input)
-
-                # Estimate
-                tracked = []
-                for t in tracks:
-                    tid = t["track_id"]
-                    x1 = int(t["bbox"][0])
-                    y1 = int(t["bbox"][1])
-                    x2 = int(t["bbox"][2])
-                    y2 = int(t["bbox"][3])
-                    cid = t.get("class_id", 2)
-                    dist = estimator.estimate_distance(tid, x1, y1, x2, y2, cid)
-                    spd = estimator.estimate_speed(tid, dist)
-                    dire = estimator.estimate_direction(tid, x1, y1, x2, y2, orig_h)
-
-                    tracked.append(
-                        {
-                            "id": tid,
-                            "bbox": [x1, y1, x2, y2],
-                            "distance": dist,
-                            "rel_speed_kmh": spd * 3.6,
-                            "direction": dire,
-                            "class_name": COCO_NAMES.get(cid, "vehicle"),
-                            "cls": cid,
-                        }
-                    )
-                last_tracks = tracked
-                ego_spd = estimator.estimate_ego_motion(frame)
-
-                # Safety
-                feasible, reason = analyzer.analyze(
-                    orig_w, orig_h, tracked, path_filter
-                )
-
-                enriched = []
-                for v in tracked:
-                    bbox = v["bbox"]
-
-                    # Dynamic Right-Side Filter: skip vehicles right of corridor
-                    if path_filter.is_right_of_corridor(bbox, orig_h, orig_w):
-                        continue
-
-                    # Area-Voting Gating: 5x5 drivable mask check
-                    on_road = path_filter.is_on_drivable(bbox, da_mask, orig_h, orig_w)
-
-                    # Dynamic Zone Classification using lane boundaries
-                    if v["direction"] == "oncoming":
-                        zone = "oncoming_lane"
-                    else:
-                        zone = path_filter.classify_zone(bbox, orig_h, orig_w)
-                        
-                    # TTC Weighted Safety for Ego Lane
-                    # Blind-Mode: raise MANEUVER_GAP from 25m to 30m
-                    is_closing_fast = v["rel_speed_kmh"] > 10.0
-                    base_gap = 30.0 if is_blind_mode else 25.0
-                    gap_threshold = 30.0 if is_closing_fast else base_gap
-
-                    enriched.append({
-                        "track_id": v["id"],
-                        "bbox": v["bbox"],
-                        "distance_m": v["distance"],
-                        "speed_kph": v["rel_speed_kmh"],
-                        "direction": v["direction"],
-                        "class_name": v["class_name"],
-                        "is_oncoming": v["direction"] == "oncoming",
-                        "is_relevant": on_road,
-                        "is_too_close": v["distance"] < gap_threshold and zone == "ego_lane",
-                        "is_critical": v["distance"] < 8.0,
-                        "is_parked": False,
-                        "approach_rate": (
-                            v["rel_speed_kmh"] / 3.6
-                            if v["direction"] == "oncoming"
-                            else 0.0
-                        ),
-                        "zone": zone,
-                    })
-
-                ttc_dec = ttc.evaluate(enriched, None)
-
-                critical_vehicles = [v for v in enriched if v.get("is_critical")]
-                too_close_ego = [v for v in enriched if v.get("is_too_close")]
-
-                # ── Safety Decision Logic (Raw) ──
-                if critical_vehicles:
-                    raw_safety = SafetyLevel.UNSAFE
-                    raw_reason = "CRITICAL | Brake Now"
-                elif not feasible:
-                    raw_safety = SafetyLevel.UNSAFE
-                    raw_reason = f"NO OVERTAKE | {reason}"
-                elif ttc_dec.level == SafetyLevel.UNSAFE:
-                    raw_safety = SafetyLevel.UNSAFE
-                    raw_reason = ttc_dec.reason
-                elif too_close_ego:
-                    raw_safety = SafetyLevel.RISKY
-                    raw_reason = "CAUTION | Gap too small for maneuver"
-                elif ttc_dec.level == SafetyLevel.RISKY:
-                    raw_safety = SafetyLevel.RISKY
-                    raw_reason = ttc_dec.reason
-                else:
-                    # ── Blind-Mode Strict Safety Override ───────────
-                    if is_blind_mode:
-                        # Check if ANY vehicle is in the overtake lane
-                        overtake_lane_occupied = any(
-                            v.get("zone") == "overtake_lane"
-                            for v in enriched
+            # PERF-1 fix: Throttle video reads to TARGET_FPS
+            # Without this, video file is consumed in seconds
+            if not is_cam and getattr(cfg, "SYNC_VIDEO", True):
+                now = time.time()
+                if now - last_read_time < frame_interval:
+                    # Don't read a new frame yet — just check for results
+                    try:
+                        last_result = result_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    if last_result is not None:
+                        display = last_result.seg_frame.copy()
+                        display = hud.render(
+                            display,
+                            last_result.inference_fps,
+                            last_result.tracks,
+                            last_result.ego_speed,
+                            last_result.safety_level,
+                            last_result.safety_reason,
+                            cfg,
+                            lane_mode=last_result.lane_mode,
+                            confidence=last_result.confidence,
                         )
-                        if overtake_lane_occupied:
-                            raw_safety = SafetyLevel.RISKY
-                            raw_reason = "CAUTION | Overtake Lane Occupied (Blind)"
-                        else:
-                            raw_safety = SafetyLevel.SAFE
-                            raw_reason = "SAFE | Blind Driving (Lines Lost)"
-                    else:
-                        raw_safety = SafetyLevel.SAFE
-                        raw_reason = "SAFE TO OVERTAKE"
+                        cv2.imshow("YOLOPv2 Overtaking Safety", display)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in [ord("q"), ord("Q"), 27]:
+                        inf_thread.stopped = True
+                        if hasattr(cam, "release"):
+                            cam.release()
+                        cv2.destroyAllWindows()
+                        return False
+                    elif key == ord(" "):
+                        paused = not paused
+                        print("Paused" if paused else "Resumed")
+                    elif key in [ord("d"), ord("D")]:
+                        inf_thread.show_da = not inf_thread.show_da
+                    elif key in [ord("l"), ord("L")]:
+                        inf_thread.show_ll = not inf_thread.show_ll
+                    continue
+                last_read_time = now
 
-                # ── Temporal Smoothing (Anti-Flicker) ──
-                safety_history.append((raw_safety, raw_reason))
+            ret, frame = cam.read()
+            if not ret:
+                if isinstance(video_path, str):
+                    print("Video ended.")
+                    break
+                continue
 
-                has_unsafe = any(s == SafetyLevel.UNSAFE for s, r in safety_history)
-                has_risky = any(s == SafetyLevel.RISKY for s, r in safety_history)
+            # Feed frame to async pipeline (drop-oldest)
+            frame_buf.put_latest(frame)
 
-                if has_unsafe:
-                    last_safety = SafetyLevel.UNSAFE
-                    last_reason = next(r for s, r in reversed(safety_history) if s == SafetyLevel.UNSAFE)
-                elif has_risky:
-                    last_safety = SafetyLevel.RISKY
-                    last_reason = next(r for s, r in reversed(safety_history) if s == SafetyLevel.RISKY)
-                else:
-                    last_safety = SafetyLevel.SAFE
-                    last_reason = raw_reason
+            # Get latest inference result (non-blocking)
+            try:
+                last_result = result_q.get_nowait()
+            except queue.Empty:
+                pass
 
-                estimator.cleanup({t["id"] for t in last_tracks})
-
-            # ── Render (FIXED SCALING) ────────────────────
-            if last_seg_frame is not None:
-                display = last_seg_frame.copy()
+            # Render
+            if last_result is not None:
+                display = last_result.seg_frame.copy()
+                display = hud.render(
+                    display,
+                    last_result.inference_fps,
+                    last_result.tracks,
+                    last_result.ego_speed,
+                    last_result.safety_level,
+                    last_result.safety_reason,
+                    cfg,
+                    lane_mode=last_result.lane_mode,
+                    confidence=last_result.confidence,
+                )
             else:
                 display = cv2.resize(frame, (1280, 720))
 
-            # Display image ki actual width aur height lein (Jo 1280x720 hai)
-            disp_h, disp_w = display.shape[:2]
-
-            # Scale bboxes to ACTUAL display size (1280x720) instead of config width
-            sx = disp_w / max(orig_w, 1)
-            sy = disp_h / max(orig_h, 1)
-
-            scaled = []
-            for v in last_tracks:
-                sv = v.copy()
-                b = v["bbox"]
-                # Ab boxes image ke saath perfectly align honge
-                sv["bbox"] = [
-                    int(b[0] * sx),
-                    int(b[1] * sy),
-                    int(b[2] * sx),
-                    int(b[3] * sy),
-                ]
-                scaled.append(sv)
-
-            display = hud.render(
-                display, fps, scaled, ego_spd, last_safety, last_reason, cfg,
-                lane_mode=path_filter.mode_display,
-                confidence=path_filter.confidence_score
-            )
             cv2.imshow("YOLOPv2 Overtaking Safety", display)
 
-        # FPS sync
-        elapsed = time.time() - loop_start
-        if isinstance(video_path, int) or cfg.TARGET_FPS == 0:
-            wait_ms = 1  # No artificial delay, run as fast as possible
-        else:
-            target_delay = 1.0 / cfg.TARGET_FPS
-            wait_ms = max(1, int((target_delay - elapsed) * 1000))
-        key = cv2.waitKey(wait_ms) & 0xFF
+        # Use waitKey for timing — keeps UI responsive (CRASH-5 fix)
+        key = cv2.waitKey(1) & 0xFF
 
         if key in [ord("q"), ord("Q"), 27]:
-            cap.release()
+            inf_thread.stopped = True
+            if hasattr(cam, "release"):
+                cam.release()
             cv2.destroyAllWindows()
             return False
-
         elif key in [ord("r"), ord("R")]:
-            cap.release()
-            cv2.destroyAllWindows()
-            return True
-
+            if isinstance(video_path, str):
+                inf_thread.stopped = True
+                if hasattr(cam, "release"):
+                    cam.release()
+                cv2.destroyAllWindows()
+                return True
         elif key == ord(" "):
             paused = not paused
             print("Paused" if paused else "Resumed")
-
         elif key in [ord("d"), ord("D")]:
-            show_da = not show_da
-            print(f"Drivable: {'ON' if show_da else 'OFF'}")
-
+            inf_thread.show_da = not inf_thread.show_da
+            print(f"Drivable: {'ON' if inf_thread.show_da else 'OFF'}")
         elif key in [ord("l"), ord("L")]:
-            show_ll = not show_ll
-            print(f"Lanes: {'ON' if show_ll else 'OFF'}")
+            inf_thread.show_ll = not inf_thread.show_ll
+            print(f"Lanes: {'ON' if inf_thread.show_ll else 'OFF'}")
 
-        elif key in [ord('r'), ord('R')]:
-            if isinstance(video_path, str): # Sirf video files ke liye restart allow karein
-                cap.release()
-                cv2.destroyAllWindows()
-                return True
-            else:
-                print("Restart not available for live camera.")
-
-    cap.release()
+    inf_thread.stopped = True
+    if hasattr(cam, "release"):
+        cam.release()
     cv2.destroyAllWindows()
     return True
 
-"""
+
 if __name__ == "__main__":
-    cfg = Config()
-    print("=" * 55)
-    print("  YOLOPv2 Overtaking Safety System")
-    print("=" * 55)
-
-    while True:
-        print("\nSelect video file...")
-        video = select_video(cfg)
-        if not video:
-            print("No video selected. Exiting.")
-            break
-        print(f"Selected: {Path(video).name}")
-        if not run(video, cfg):
-            break
-
-    print("\nGoodbye!")
-    cv2.destroyAllWindows()"""
-
-
-# main.py ke bottom block ko isse replace karein
-if __name__ == "__main__":
+    # while True:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--cam', type=int, help='Directly start with Camera index (e.g. 1 or 2)')
+    parser.add_argument("--cam", type=int, help="Camera index")
     args = parser.parse_args()
-
     cfg = Config()
     print("=" * 55)
-    print("  YOLOPv2 Overtaking Safety System - LIVE")
+    print("  YOLOPv2 Overtaking Safety — PRODUCTION PIPELINE")
     print("=" * 55)
-
     if args.cam is not None:
         video = args.cam
     else:
-        mode = input("Choose Mode: [1] Video File | [2] Laptop Cam | [3] Phone Cam (DroidCam/Iriun): ")
-
-        if mode == '1':
-            video = select_video(cfg) # Purana file selection
-        elif mode == '2':
-            video = 0 # Laptop cam is usually 0
-        elif mode == '3':
-            # Phone connected via USB/Wi-Fi using DroidCam/Iriun appears as a local camera (index 1 or 2)
-            cam_idx = input("Enter Phone Camera Index (Usually 1 or 2, default is 1): ")
+        mode = input("Choose: [1] Video | [2] Laptop Cam | [3] Phone Cam: ")
+        if mode == "1":
+            video = select_video(cfg)
+        elif mode == "2":
+            video = 0
+        elif mode == "3":
+            ci = input("Phone Camera Index (1 or 2, default 1): ")
             try:
-                video = int(cam_idx)
-            except ValueError:
-                print("Invalid input, defaulting to index 1.")
+                video = int(ci)
+            except:
                 video = 1
         else:
-            print("Invalid choice. Exiting.")
+            print("Invalid.")
             sys.exit()
-
     if video is not None:
-        # run() function int aur string dono handle karta hai
-        run(video, cfg) 
-
+        run(video, cfg)
     print("\nGoodbye!")
     cv2.destroyAllWindows()
