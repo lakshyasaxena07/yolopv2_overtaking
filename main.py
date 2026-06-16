@@ -470,10 +470,10 @@ class InferenceThread(threading.Thread):
 # SECTION 5: HUD RENDERER
 # ════════════════════════════════════════════════════════════
 class HUDRenderer:
-    INFO_COL = (0, 255, 255)
-    SAFE_COL = (0, 220, 0)
-    CAUTION_COL = (0, 165, 255)
-    UNSAFE_COL = (0, 0, 255)
+    INFO_COL = (0, 255, 255) # Yellow
+    SAFE_COL = (0, 220, 0) #Green
+    CAUTION_COL = (0, 165, 255) #Orange
+    UNSAFE_COL = (0, 0, 255) #Red
 
     def render(
         self,
@@ -486,6 +486,7 @@ class HUDRenderer:
         cfg,
         lane_mode="OPTICAL",
         confidence=1.0,
+        separate_window=False,
     ):
         h, w = frame.shape[:2]
         cv2.rectangle(frame, (0, 0), (w, 52), (20, 20, 20), -1)
@@ -507,6 +508,16 @@ class HUDRenderer:
             self.INFO_COL,
             2,
         )
+    #     cv2.putText(
+    #     frame,
+    #     "---------Your Custom Text-----------",
+    #     (100, 200),          # x, y position (top-left corner)
+    #     cv2.FONT_HERSHEY_SIMPLEX,  # font type
+    #     1.0,                 # font size
+    #     (255, 255, 0),       # color (B, G, R format)
+    #     2                    # thickness
+    # )
+
         cv2.putText(
             frame,
             f"Ego: {ego_speed*3.6:.1f} km/h",
@@ -564,27 +575,52 @@ class HUDRenderer:
         else:
             bcol, txt, tcol = (0, 0, 140), "UNSAFE", self.UNSAFE_COL
 
-        cv2.rectangle(frame, (0, h - 85), (w, h), bcol, -1)
-        ts = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, 1.8, 3)[0]
-        cv2.putText(
-            frame,
-            txt,
-            ((w - ts[0]) // 2, h - 45),
-            cv2.FONT_HERSHEY_DUPLEX,
-            1.8,
-            tcol,
-            3,
-        )
-        rs = cv2.getTextSize(reason, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-        cv2.putText(
-            frame,
-            reason,
-            ((w - rs[0]) // 2, h - 12),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (220, 220, 220),
-            2,
-        )
+        if separate_window:
+            banner = np.zeros((85, w, 3), dtype=np.uint8)
+            cv2.rectangle(banner, (0, 0), (w, 85), bcol, -1)
+            ts = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, 1.8, 3)[0]
+            cv2.putText(
+                banner,
+                txt,
+                ((w - ts[0]) // 2, 40),
+                cv2.FONT_HERSHEY_DUPLEX,
+                1.8,
+                tcol,
+                3,
+            )
+            rs = cv2.getTextSize(reason, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(
+                banner,
+                reason,
+                ((w - rs[0]) // 2, 73),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (220, 220, 220),
+                2,
+            )
+        else:
+            cv2.rectangle(frame, (0, h - 85), (w, h), bcol, -1)
+            ts = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, 1.8, 3)[0]
+            cv2.putText(
+                frame,
+                txt,
+                ((w - ts[0]) // 2, h - 45),
+                cv2.FONT_HERSHEY_DUPLEX,
+                1.8,
+                tcol,
+                3,
+            )
+            rs = cv2.getTextSize(reason, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            cv2.putText(
+                frame,
+                reason,
+                ((w - rs[0]) // 2, h - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (220, 220, 220),
+                2,
+            )
+            banner = None
         cv2.putText(
             frame,
             "D=drivable  L=lanes  R=restart  Q=quit",
@@ -594,9 +630,9 @@ class HUDRenderer:
             (170, 170, 170),
             1,
         )
-        return frame
+        return frame, banner
 
-    def render_sensor_failure(self, frame):
+    def render_sensor_failure(self, frame, separate_window=False):
         """Red fullscreen SENSOR FAILURE overlay."""
         h, w = frame.shape[:2]
         overlay = frame.copy()
@@ -622,13 +658,27 @@ class HUDRenderer:
             (200, 200, 200),
             2,
         )
-        return frame
+        if separate_window:
+            banner = np.zeros((85, w, 3), dtype=np.uint8)
+            cv2.rectangle(banner, (0, 0), (w, 85), (0, 0, 180), -1)
+            cv2.putText(
+                banner,
+                txt,
+                ((w - ts[0]) // 2, 40),
+                cv2.FONT_HERSHEY_DUPLEX,
+                1.8,
+                (255, 255, 255),
+                3,
+            )
+        else:
+            banner = None
+        return frame, banner
 
 
 # ════════════════════════════════════════════════════════════
 # SECTION 6: MAIN RUN LOOP
 # ════════════════════════════════════════════════════════════
-def run(video_path, cfg):
+def run(video_path, cfg, separate_window=False):
     hud = HUDRenderer()
     frame_buf = DropOldestBuffer(maxsize=2)
     result_q = queue.Queue(maxsize=1)
@@ -657,6 +707,10 @@ def run(video_path, cfg):
     cv2.namedWindow("YOLOPv2 Overtaking Safety", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("YOLOPv2 Overtaking Safety", cfg.OUTPUT_WIDTH, cfg.OUTPUT_HEIGHT)
 
+    if separate_window:
+        cv2.namedWindow("Safety Alert", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Safety Alert", cfg.OUTPUT_WIDTH, 85)
+
     last_result = None
     paused = False
     # Blank frame for sensor failure overlay
@@ -680,8 +734,10 @@ def run(video_path, cfg):
         if not paused:
             # Check sensor failure (live camera only)
             if is_cam and hasattr(cam, "sensor_failed") and cam.sensor_failed:
-                display = hud.render_sensor_failure(blank.copy())
+                display, banner = hud.render_sensor_failure(blank.copy(), separate_window)
                 cv2.imshow("YOLOPv2 Overtaking Safety", display)
+                if separate_window and banner is not None:
+                    cv2.imshow("Safety Alert", banner)
                 if (cv2.waitKey(100) & 0xFF) in [ord("q"), ord("Q"), 27]:
                     break
                 continue
@@ -698,7 +754,7 @@ def run(video_path, cfg):
                         pass
                     if last_result is not None:
                         display = last_result.seg_frame.copy()
-                        display = hud.render(
+                        display, banner = hud.render(
                             display,
                             last_result.inference_fps,
                             last_result.tracks,
@@ -708,8 +764,11 @@ def run(video_path, cfg):
                             cfg,
                             lane_mode=last_result.lane_mode,
                             confidence=last_result.confidence,
+                            separate_window=separate_window,
                         )
                         cv2.imshow("YOLOPv2 Overtaking Safety", display)
+                        if separate_window and banner is not None:
+                            cv2.imshow("Safety Alert", banner)
                     key = cv2.waitKey(1) & 0xFF
                     if key in [ord("q"), ord("Q"), 27]:
                         inf_thread.stopped = True
@@ -746,7 +805,7 @@ def run(video_path, cfg):
             # Render
             if last_result is not None:
                 display = last_result.seg_frame.copy()
-                display = hud.render(
+                display, banner = hud.render(
                     display,
                     last_result.inference_fps,
                     last_result.tracks,
@@ -756,11 +815,18 @@ def run(video_path, cfg):
                     cfg,
                     lane_mode=last_result.lane_mode,
                     confidence=last_result.confidence,
+                    separate_window=separate_window,
                 )
             else:
                 display = cv2.resize(frame, (1280, 720))
+                if separate_window:
+                    banner = np.zeros((85, 1280, 3), dtype=np.uint8)
+                else:
+                    banner = None
 
             cv2.imshow("YOLOPv2 Overtaking Safety", display)
+            if separate_window and banner is not None:
+                cv2.imshow("Safety Alert", banner)
 
         # Use waitKey for timing — keeps UI responsive (CRASH-5 fix)
         key = cv2.waitKey(1) & 0xFF
@@ -799,11 +865,18 @@ if __name__ == "__main__":
     # while True:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cam", type=int, help="Camera index")
+    parser.add_argument("--sep", action="store_true", help="Separate alert window")
     args = parser.parse_args()
     cfg = Config()
     print("=" * 55)
     print("  YOLOPv2 Overtaking Safety — PRODUCTION PIPELINE")
     print("=" * 55)
+    
+    separate_window = args.sep
+    if not separate_window and not any(arg in sys.argv for arg in ['--sep']):
+        ans = input("Do you want a separate alert window? [y/N]: ").strip().lower()
+        separate_window = (ans == 'y')
+
     if args.cam is not None:
         video = args.cam
     else:
@@ -813,7 +886,7 @@ if __name__ == "__main__":
         elif mode == "2":
             video = 0
         elif mode == "3":
-            ci = input("Phone Camera Index (1 or 2, default 1): ")
+            ci = input("Phone Camera Index (1 for droidcam, 2 for webcam): ")
             try:
                 video = int(ci)
             except:
@@ -822,6 +895,6 @@ if __name__ == "__main__":
             print("Invalid.")
             sys.exit()
     if video is not None:
-        run(video, cfg)
+        run(video, cfg, separate_window=separate_window)
     print("\nGoodbye!")
     cv2.destroyAllWindows()

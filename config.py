@@ -12,15 +12,15 @@ class Config:
     IOU_THRESH       = 0.45
     IMG_SIZE         = 384   # Matches your static ONNX model exactly
 
-    # COCO vehicle classes
+    # BDD100k dataset vehicle classes
     VEHICLE_CLASSES  = [1, 2, 3, 5, 7]
     # 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck
+
 
     # ── Camera / Video ─────────────────────────────────────────
     CAMERA_SOURCE    = 0
     FRAME_WIDTH      = 1280
     FRAME_HEIGHT     = 720
-    TARGET_FPS       = 30           # Matches normal.mp4
     SYNC_VIDEO       = True         # Fixes 'fast video' issue
 
     # ── Fault Tolerance ────────────────────────────────────────
@@ -73,3 +73,6 @@ class Config:
     SHOW_EGO_SPEED       = True
     SHOW_DIRECTION_DEBUG = False
     SHOW_DRIVABLE_DEBUG  = False    
+
+
+    TARGET_FPS       = 30           # Matches normal.mp4

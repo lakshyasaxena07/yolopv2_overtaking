@@ -13,7 +13,7 @@ class FocalLengthCalibrator:
     Dynamic Focal Length Calibration Helper.
 
     SAFETY-CRITICAL: The pinhole model dist = (real_width × focal_length) / pixel_width
-    is only accurate when FOCAL_LENGTH_PX matches the actual camera.
+    is only accurate when FOCAL_LENGTH_PX matches the lactual camera.
     Phone cameras (DroidCam/Iriun) have variable effective focal lengths
     depending on zoom, stabilization, and virtual driver downsampling.
 
