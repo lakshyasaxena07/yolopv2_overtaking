@@ -417,7 +417,7 @@ This project is provided as-is for educational and research purposes.
 
 ## 👨‍💻 Author
 
-Developed by [Lakshya Saxena] and [Preeti Khachne] (https://github.com/lakshyasaxena07) as a vehicle safety analysis system for overtaking scenarios.
+Developed by [Lakshya Saxena](https://github.com/lakshyasaxena07) and [Preeti Khachne](https://github.com/Preeti9343) as a vehicle safety analysis system for overtaking scenarios.
 
 ## 💬 Support
 
