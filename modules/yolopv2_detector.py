@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 # Path configuration
-YOLOPV2_DIR = Path(r"E:\Minor 2\claude\YOLOPv2")
+YOLOPV2_DIR = Path(__file__).resolve().parent.parent / "YOLOPv2-main"
 if str(YOLOPV2_DIR) not in sys.path:
     sys.path.insert(0, str(YOLOPV2_DIR))
 

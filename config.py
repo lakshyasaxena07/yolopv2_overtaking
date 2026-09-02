@@ -1,10 +1,14 @@
 # config.py — YOLOPv2 Overtaking Safety System (Production Config)
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+MODEL_DIR = PROJECT_ROOT / "models"
 
 class Config:
 
     # ── YOLOPv2 Model ──────────────────────────────────────────
-    MODEL_PATH       = r"E:\Minor 2\Most_Stable\Claude\yolopv2\models\yolopv2.pt"
-    ONNX_MODEL_PATH  = r"E:\Minor 2\Most_Stable\Claude\yolopv2\models\yolopv2_fp16.onnx"
+    MODEL_PATH       = str(MODEL_DIR / "yolopv2.pt")
+    ONNX_MODEL_PATH  = str(MODEL_DIR / "yolopv2_fp16.onnx")
     USE_ONNX         = True
     USE_TENSORRT     = False # onnxruntime 1.24.4 + CUDA 13.0 = TRT segfault. CUDA EP is fast enough.
     DEVICE           = "cuda"
